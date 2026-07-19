@@ -14,9 +14,6 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid_main.c \
   $(PROJ_DIR)/settings.c \
   $(PROJ_DIR)/usb_main.c \
-  $(PROJ_DIR)/usb/app_usbd_ccid.c \
-  $(PROJ_DIR)/usb/ccid_slot.c \
-  $(PROJ_DIR)/usb/hf14a_4_reader.c \
   $(PROJ_DIR)/rgb_marquee.c \
   $(PROJ_DIR)/bsp/bsp_delay.c \
   $(PROJ_DIR)/bsp/bsp_time.c \
@@ -362,6 +359,9 @@ ifeq	(${CURRENT_DEVICE_TYPE}, ${CHAMELEON_ULTRA})
     $(PROJ_DIR)/rfid/reader/lf/lf_ioprox_data.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_viking_data.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_jablotron_data.c \
+    $(PROJ_DIR)/usb/app_usbd_ccid.c \
+    $(PROJ_DIR)/usb/ccid_slot.c \
+    $(PROJ_DIR)/usb/hf14a_4_reader.c \
 
   INC_FOLDERS +=\
     ${PROJ_DIR}/rfid/reader/ \

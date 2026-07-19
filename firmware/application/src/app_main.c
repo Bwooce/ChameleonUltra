@@ -921,6 +921,7 @@ extern bool g_usb_led_marquee_enable;
 static void button_press_process(void) {
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
         // Physical interaction decisively pre-empts the CCID reader: turn it off
         // and return to card emulation so the button action runs cleanly (the
         // CCID presence scanner otherwise fights it for reader mode). Runtime
@@ -930,6 +931,7 @@ static void button_press_process(void) {
             ccid_slot_set_enabled(false);
             tag_mode_enter();
         }
+#endif
         if (m_is_a_btn_release) {
             if (!m_is_btn_long_press) {
                 run_button_function_by_settings(settings_get_button_press_config('a'));

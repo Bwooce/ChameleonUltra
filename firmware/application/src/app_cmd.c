@@ -224,6 +224,7 @@ static data_frame_tx_t *cmd_processor_set_sleep_timeout(uint16_t cmd, uint16_t s
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
 
+#if defined(PROJECT_CHAMELEON_ULTRA)
 static data_frame_tx_t *cmd_processor_get_ccid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     /* Report the live runtime state (a button press can runtime-disable the
      * reader without changing the saved setting), so the CLI reflects reality. */
@@ -235,9 +236,11 @@ static data_frame_tx_t *cmd_processor_set_ccid_enable(uint16_t cmd, uint16_t sta
         return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
     }
     bool enable = (data[0] != 0);
-    settings_set_ccid_enable(enable);
-    settings_save_config();            // persist so it survives reboot
-    ccid_slot_set_enabled(enable);     // apply immediately
+    if (settings_get_ccid_enable() != enable) {
+        settings_set_ccid_enable(enable);
+        settings_save_config();        // persist only on change (avoid flash wear)
+    }
+    ccid_slot_set_enabled(enable);     // always apply the runtime state
     if (!enable) {
         // CCID off => normal Chameleon: return to card emulation. (When enabled,
         // the CCID presence scanner switches to reader mode on its own.)
@@ -245,6 +248,7 @@ static data_frame_tx_t *cmd_processor_set_ccid_enable(uint16_t cmd, uint16_t sta
     }
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
+#endif // PROJECT_CHAMELEON_ULTRA
 
 static data_frame_tx_t *cmd_processor_get_ble_pairing_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t is_enable = settings_get_ble_pairing_enable();
@@ -3037,8 +3041,10 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_SET_BLE_PAIRING_ENABLE,       NULL,                        cmd_processor_set_ble_pairing_enable,        NULL                   },
     {    DATA_CMD_GET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_get_sleep_timeout,             NULL                   },
     {    DATA_CMD_SET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_set_sleep_timeout,             NULL                   },
+#if defined(PROJECT_CHAMELEON_ULTRA)
     {    DATA_CMD_GET_CCID_ENABLE,              NULL,                        cmd_processor_get_ccid_enable,               NULL                   },
     {    DATA_CMD_SET_CCID_ENABLE,              NULL,                        cmd_processor_set_ccid_enable,               NULL                   },
+#endif
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)

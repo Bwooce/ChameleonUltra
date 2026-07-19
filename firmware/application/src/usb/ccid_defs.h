@@ -122,10 +122,9 @@ void ccid_slot_set_enabled(bool en);
 
 /* Radio-hold owners (IM-33). CCID yields while any are held. */
 #define CCID_HOLD_CDC     0x01   /* CDC reader/attack command using the radio */
-#define CCID_HOLD_BUTTON  0x02   /* human button activity                     */
 
-/** @brief Hold/release the radio for another consumer (ISR-safe). CCID reports
- *  card-removed and stops scanning/relaying while any hold is set. */
+/** @brief Hold/release the radio for another consumer (main-loop context only).
+ *  CCID reports card-removed and stops scanning/relaying while any hold is set. */
 void ccid_slot_radio_hold(uint8_t who, bool held);
 
 /** @brief Back-compat: hold/release the CDC radio lock (Q5). */

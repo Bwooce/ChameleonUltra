@@ -127,8 +127,11 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
     s->blk ^= 1;
     uint8_t  resp_pcb = rbuf[0];
     uint16_t out = 0;
-    uint8_t  dlen = (uint8_t)(rb - 3u);        /* strip PCB + CRC */
-    if (dlen > 0 && out + dlen <= resp_max) {
+    /* rb is one T=CL frame, bounded by the card FSC (<= 256) and by rbuf, so
+     * rb - 3 (PCB + 2-byte CRC stripped) always fits in a uint8_t. */
+    uint8_t  dlen = (uint8_t)(rb - 3u);
+    if (dlen > 0) {
+        if (out + dlen > resp_max) { *resp_len = 0; return false; } /* response would overflow */
         memcpy(&resp[out], &rbuf[1], dlen);
         out += dlen;
     }
@@ -155,7 +158,8 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                 if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
                 resp_pcb = rbuf[0];
                 dlen = (uint8_t)(rb - 3u);
-                if (dlen > 0 && out + dlen <= resp_max) {
+                if (dlen > 0) {
+                    if (out + dlen > resp_max) { *resp_len = 0; return false; } /* response would overflow */
                     memcpy(&resp[out], &rbuf[1], dlen);
                     out += dlen;
                 }
@@ -180,7 +184,8 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
         resp_pcb = rbuf[0];
         dlen = (uint8_t)(rb - 3u);
-        if (dlen > 0 && out + dlen <= resp_max) {
+        if (dlen > 0) {
+            if (out + dlen > resp_max) { *resp_len = 0; return false; } /* response would overflow */
             memcpy(&resp[out], &rbuf[1], dlen);
             out += dlen;
         }
@@ -190,19 +195,81 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
     return out > 0;
 }
 
+/* Cheap "is anything in the field?" probe: a single WUPA, short timeout.
+ *
+ * Deliberately NOT pcd_14a_reader_atqa_request(): that retries up to 10 times,
+ * and pcd_14a_reader_scan_auto() then runs scan_once twice, so an idle (no
+ * card) poll costs ~20 timeouts -- roughly 2 s. Polled every 300 ms that keeps
+ * the main loop permanently busy, starving the USB event queue (unusable CDC
+ * latency, and before the enumeration gate, a device that never enumerated).
+ *
+ * WUPA (0x52) rather than REQA (0x26) so HALTed/already-selected cards answer
+ * too, which is why no antenna field-cycle is needed here. */
+static bool hf14a_4_quick_probe(uint8_t atqa_out[2]) {
+    uint8_t wupa[] = { PICC_REQALL };
+    uint8_t resp[2] = {0};
+    uint16_t len = 0;
+
+    /* The field must be up for the card to answer: hf14a_4_session_close() (and
+     * the failure paths in session_open) leave the antenna OFF, so probing
+     * without this silently never detects a card. Note we only switch it ON --
+     * WUPA removes the need for the old off/on field-cycle, but not the need
+     * for a field. The settle delay lets the card power up before it answers. */
+    pcd_14a_reader_antenna_on();
+    bsp_delay_ms(HF14A_4_FIELD_SETTLE_MS);
+
+    pcd_14a_reader_timeout_set(HF14A_4_PROBE_TIMEOUT_MS);
+    uint8_t status = pcd_14a_reader_bits_transfer(wupa, 7, NULL, resp, NULL, &len,
+                                                  U8ARR_BIT_LEN(resp));
+    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    if (status != STATUS_HF_TAG_OK || len != 16) return false;  /* ATQA is 2 bytes */
+    if (atqa_out) memcpy(atqa_out, resp, 2);
+    return true;
+}
+
+/* Whatever is currently in the field has already been classified, so repeat
+ * polls need only the cheap probe. Cleared as soon as the field goes empty. */
+static bool    s_classified = false;
+static bool    s_is_iso4    = false;
+static uint8_t s_atqa[2]    = {0};
+
 bool hf14a_4_presence(void) {
     reader_mode_enter();               /* idempotent: no-op if already reader  */
-    /* Field-cycle so a previously-selected/halted card returns to IDLE and
-     * answers REQA again (avoids presence flapping between polls). */
-    pcd_14a_reader_antenna_off();
-    bsp_delay_ms(2);
-    pcd_14a_reader_antenna_on();
-    bsp_delay_ms(3);
+
+    /* Tier 1: cheap probe. The common idle case (no card) exits here in a few
+     * ms instead of ~2 s. */
+    uint8_t atqa[2] = {0};
+    if (!hf14a_4_quick_probe(atqa)) {
+        s_classified = false;
+        s_is_iso4    = false;
+        return false;
+    }
+
+    /* Same card still sitting there -- no need to re-run the costly scan. The
+     * ATQA guard catches a swap to a different card type that happens fast
+     * enough that no poll saw an empty field (otherwise we would report the
+     * previous card's classification). Same ATQA does not prove same card, but
+     * a changed one definitely proves a different card, and it is free here. */
+    if (s_classified && memcmp(atqa, s_atqa, sizeof(atqa)) == 0) return s_is_iso4;
+
+    /* Tier 2: newly arrived -- pay for the full scan, since confirming an
+     * ISO14443-4 card needs the SAK (anticollision + SELECT). */
     pcd_14a_reader_timeout_set(100);
     picc_14a_tag_t tag;
     uint8_t status = pcd_14a_reader_scan_auto(&tag);
     pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-    return (status == STATUS_HF_TAG_OK) && (tag.sak & 0x20);
+
+    /* Leave the card HALTed. scan_auto leaves it SELECTED/ACTIVE, and an ACTIVE
+     * card ignores WUPA -- so the next probe would report it gone and presence
+     * would flap (the host then never sees a stable card to connect to). The
+     * old field-cycle hid this by power-cycling the card back to IDLE; halting
+     * achieves the same for far less time. */
+    pcd_14a_reader_fast_halt_tag();
+
+    s_is_iso4    = (status == STATUS_HF_TAG_OK) && (tag.sak & 0x20);
+    s_classified = true;
+    memcpy(s_atqa, atqa, sizeof(s_atqa));
+    return s_is_iso4;
 }
 
 void hf14a_4_session_close(hf14a_4_session_t *s) {

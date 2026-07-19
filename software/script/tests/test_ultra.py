@@ -137,9 +137,9 @@ class TestCLI(unittest.TestCase):
         self.eval('hw settings ccid -d')                 # known state: disabled
         self.r('hw settings ccid', r'CCID reader:.*Disabled')
         self.r('hw mode', r'Tag Emulator')               # disable restores emulation
-        self.r('hw settings ccid -e', r'(changed CCID reader to.*Enabled|already enabled)')
+        self.r('hw settings ccid -e', r'CCID reader:.*Enabled.*PC/SC reader')
         self.r('hw settings ccid', r'CCID reader:.*Enabled')
-        self.r('hw settings ccid -d', r'(changed CCID reader to.*Disabled|already disabled)')
+        self.r('hw settings ccid -d', r'CCID reader:.*Disabled.*returned to card emulation')
         self.r('hw settings ccid', r'CCID reader:.*Disabled')
         self.r('hw mode', r'Tag Emulator')               # left in emulation mode
         self.eval('hw disconnect')

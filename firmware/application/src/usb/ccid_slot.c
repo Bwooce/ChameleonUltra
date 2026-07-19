@@ -16,11 +16,11 @@
  * it behaves as an empty reader. Wired to settings.c in IM-10. */
 static bool m_ccid_enabled = false;
 /* Radio arbitration (Q5 + IM-33): CCID yields the radio to other consumers.
- * Bitmask of who currently owns it — CDC reader/attack commands and human
- * button activity. Non-zero => CCID reports card-removed and won't scan/relay.
- * Holds may be set from ISR context (buttons), so they only flip the mask;
- * the session teardown happens lazily in the main-loop presence poll. */
-static volatile uint8_t m_radio_holders = 0;
+ * Bitmask of who currently owns it — today only the CDC reader/attack commands
+ * (buttons pre-empt CCID by disabling it outright, not via a hold). Non-zero =>
+ * CCID reports card-removed and won't scan/relay. Set and read only from
+ * main-loop context, so no synchronisation is needed. */
+static uint8_t m_radio_holders = 0;
 
 static hf14a_4_session_t m_session;
 /* Current cached presence, and the last state pushed to the host. */
@@ -32,7 +32,7 @@ static inline bool radio_is_ours(void) {
 }
 
 void ccid_slot_radio_hold(uint8_t who, bool held) {
-    if (held) m_radio_holders |= who;   /* ISR-safe: only touches the mask */
+    if (held) m_radio_holders |= who;
     else      m_radio_holders &= (uint8_t)~who;
 }
 /* Back-compat wrapper for the CDC reader/attack hooks. */

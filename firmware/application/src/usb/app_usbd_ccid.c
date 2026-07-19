@@ -47,7 +47,11 @@ static const uint8_t m_ccid_func_desc[CCID_FUNC_DESC_LENGTH] = {
     CCID_DESC_TYPE_FUNCTIONAL,      /* bDescriptorType = 0x21                */
     0x10, 0x01,                     /* bcdCCID = 1.10                        */
     0x00,                           /* bMaxSlotIndex = 0 (1 slot)            */
-    0x00,                           /* bVoltageSupport (contactless: n/a)    */
+    0x00,                           /* bVoltageSupport (contactless: n/a).    */
+                                    /* NOTE: 0x01 (5V) was tried for strict   */
+                                    /* libccid/usbccid.sys, but is under       */
+                                    /* investigation for a macOS enumeration   */
+                                    /* regression -- keep the known-good 0x00. */
     0x02, 0x00, 0x00, 0x00,         /* dwProtocols = T=1                     */
     0xFC, 0x0D, 0x00, 0x00,         /* dwDefaultClock = 3580 kHz             */
     0xFC, 0x0D, 0x00, 0x00,         /* dwMaximumClock = 3580 kHz             */
@@ -214,13 +218,18 @@ static ret_code_t ccid_setup_class_in(app_usbd_class_inst_t const *p_inst,
 static ret_code_t ccid_setup_class_out(app_usbd_class_inst_t const *p_inst,
                                        app_usbd_setup_evt_t const *p_setup) {
     switch (p_setup->setup.bRequest) {
-    case CCID_REQ_ABORT:
-        /* Abort in-flight bulk transfers; the matching PC_to_RDR_Abort on the
-         * bulk pipe completes the handshake. */
+    case CCID_REQ_ABORT: {
+        /* CCID CLASS ABORT (control): wValue = (bSeq << 8) | bSlot. This is a
+         * single-slot reader, so only slot 0 is valid; reject anything else.
+         * We resync both bulk pipes and re-arm RX so the reader recovers. The
+         * bSeq match against the paired PC_to_RDR_Abort bulk message is not
+         * tracked, as no supported host issues the abort pair in normal use. */
+        if (p_setup->setup.wValue.lb != 0) return NRF_ERROR_NOT_SUPPORTED;
         nrf_drv_usbd_ep_abort(BULK_OUT_EP(p_inst));
         nrf_drv_usbd_ep_abort(BULK_IN_EP(p_inst));
         (void)ccid_rx_start(p_inst);
         return NRF_SUCCESS;
+    }
     default:
         return NRF_ERROR_NOT_SUPPORTED;
     }

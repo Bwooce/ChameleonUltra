@@ -18,9 +18,10 @@
 #include <stdbool.h>
 
 #define HF14A_4_ATS_MAX     32
-#define HF14A_4_RESP_MAX    512   /* reassembled (chained) response ceiling  */
 #define HF14A_4_CMD_MAX     261   /* command APDU ceiling (matches CCID short) */
 #define HF14A_4_FSC_DEFAULT 64    /* fallback frame size if ATS omits it      */
+#define HF14A_4_PROBE_TIMEOUT_MS 10 /* idle presence probe: ATQA answers in ~1ms */
+#define HF14A_4_FIELD_SETTLE_MS  3  /* let the RF field power the card up        */
 #define HF14A_4_TX_FRAME_MAX 48   /* reliable RC522 TX frame cap (== our FSD); */
                                   /* larger frames near the 64B FIFO are flaky */
 

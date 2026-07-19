@@ -180,6 +180,14 @@ void usb_cdc_init(void) {
 // only when presence changes. Called from the main loop.
 void ccid_periodic_run(void) {
 #if defined(PROJECT_CHAMELEON_ULTRA)
+    /* Gate on ENUMERATION COMPLETE, not merely USB power. g_usb_connected is set
+     * from APP_USBD_EVT_POWER_READY, i.e. before app_usbd_start() has finished
+     * enumerating. Scanning that early runs blocking RF work (antenna cycling,
+     * bsp_delay_ms, scan timeouts) in the main loop, which starves the USB event
+     * queue so the device misses the host's SETUP requests and never enumerates.
+     * With ccid_enable persisted true that made the device invisible on USB from
+     * boot. Only scan once the host has actually configured us. */
+    if (app_usbd_core_state_get() != APP_USBD_STATE_Configured) return;
     if (!g_usb_connected) return;
     static uint32_t last_tick = 0;
     uint32_t now = app_timer_cnt_get();
