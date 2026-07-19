@@ -40,9 +40,15 @@ static bool session_idle_long_enough(void) {
     uint32_t now = app_timer_cnt_get();
     return app_timer_cnt_diff_compute(now, m_last_apdu_tick) >= APP_TIMER_TICKS(CCID_SESSION_IDLE_MS);
 }
-/* Current cached presence, and the last state pushed to the host. */
+/* Current cached presence, and what the HOST is believed to know. The latter is
+ * deliberately a tristate: it is a statement about the host's knowledge, not a
+ * snapshot of ours. A bool cannot express "the host's view was reset", and the
+ * previous invert trick collided with the state the next scan would produce --
+ * cable pull zeroed presence while the card was still physically there, so the
+ * inverted value matched what the first post-reset scan found and the card was
+ * never announced. */
 static bool m_card_present = false;
-static bool m_notified_present = false;
+static enum { NOTIFY_UNKNOWN, NOTIFY_ABSENT, NOTIFY_PRESENT } m_notified = NOTIFY_UNKNOWN;
 
 static inline bool radio_is_ours(void) {
     return m_ccid_enabled && (m_radio_holders == 0);
@@ -77,10 +83,10 @@ static void presence_lost(void) {
 
 void ccid_slot_radio_shutdown(void) {
     presence_lost();
-    /* Force the next presence change to be re-notified: after a suspend, cable
-     * pull or de-configure the host's view is stale or reset, and a matching
-     * m_notified_present would suppress the notification forever. */
-    m_notified_present = true;
+    /* The host's view is now stale or about to be reset, so record that we do
+     * not know what it thinks rather than asserting a value that could collide
+     * with the next scan result. */
+    m_notified = NOTIFY_UNKNOWN;
 }
 
 bool ccid_slot_card_present(void) { return m_card_present; }
@@ -107,18 +113,20 @@ bool ccid_slot_presence_changed(bool *present) {
         m_card_present = false;                    /* not our radio -> absent   */
     }
     *present = m_card_present;
-    return m_card_present != m_notified_present;
+    return (m_card_present ? NOTIFY_PRESENT : NOTIFY_ABSENT) != m_notified;
 }
 
-void ccid_slot_mark_notified(void) { m_notified_present = m_card_present; }
+void ccid_slot_mark_notified(void) {
+    m_notified = m_card_present ? NOTIFY_PRESENT : NOTIFY_ABSENT;
+}
 
 void ccid_slot_invalidate_notify(void) {
-    /* After a bus reset the host's slot state is unknown, but we still believed
-     * we had told it -- so presence_changed() reported no change and a card
-     * sitting on the reader across re-enumeration was never announced. Masked
-     * on macOS because it also polls GetSlotStatus; a notification-only host
-     * would simply never see the card. */
-    m_notified_present = !m_card_present;
+    /* After a bus reset the host's slot state is unknown, so forget what we
+     * think we told it -- otherwise presence_changed() reports no change and a
+     * card already sitting on the reader is never announced across a
+     * re-enumeration. Masked on macOS because it also polls GetSlotStatus; a
+     * notification-only host would simply never see the card. */
+    m_notified = NOTIFY_UNKNOWN;
 }
 
 /**
