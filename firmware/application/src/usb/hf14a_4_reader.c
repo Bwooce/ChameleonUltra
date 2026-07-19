@@ -141,7 +141,7 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
      * frame would wrap a uint8_t and silently discard most of the payload. */
     uint16_t dlen = (uint16_t)(rb - 3u);
     if (dlen > 0) {
-        if (out + dlen > resp_max) { *resp_len = 0; s->active = false; return false; } /* overflow: kill the session, see note */
+        if (out + dlen > resp_max) { *resp_len = 0; hf14a_4_session_close(s); return false; } /* overflow: kill the session, see note */
         memcpy(&resp[out], &rbuf[1], dlen);
         out += dlen;
     }
@@ -169,7 +169,7 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                 resp_pcb = rbuf[0];
                 dlen = (uint16_t)(rb - 3u);
                 if (dlen > 0) {
-                    if (out + dlen > resp_max) { *resp_len = 0; s->active = false; return false; } /* overflow: kill the session, see note */
+                    if (out + dlen > resp_max) { *resp_len = 0; hf14a_4_session_close(s); return false; } /* overflow: kill the session, see note */
                     memcpy(&resp[out], &rbuf[1], dlen);
                     out += dlen;
                 }
@@ -195,7 +195,7 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         resp_pcb = rbuf[0];
         dlen = (uint16_t)(rb - 3u);
         if (dlen > 0) {
-            if (out + dlen > resp_max) { *resp_len = 0; s->active = false; return false; } /* overflow: kill the session, see note */
+            if (out + dlen > resp_max) { *resp_len = 0; hf14a_4_session_close(s); return false; } /* overflow: kill the session, see note */
             memcpy(&resp[out], &rbuf[1], dlen);
             out += dlen;
         }
@@ -391,9 +391,37 @@ bool hf14a_4_session_present(hf14a_4_session_t *s) {
     return true;
 }
 
+void hf14a_4_field_off(void) {
+    /* The ONLY antenna-off entry point above rc522. Switching the field off is a
+     * POWER decision (disable, radio hold, USB suspend, cable pull, de-config),
+     * never a presence decision -- see hf14a_4_session_close(). */
+    pcd_14a_reader_antenna_off();
+}
+
 void hf14a_4_session_close(hf14a_4_session_t *s) {
     if (s->active) {
-        pcd_14a_reader_antenna_off();
+        /* S(DESELECT): move the card from PROTOCOL to HALT, and LEAVE THE FIELD
+         * ON. This matters more than it looks. A RATS'd card sits in PROTOCOL
+         * state, where it ignores WUPA -- so if we merely deactivated the
+         * session and kept the field, the still-present card would never answer
+         * the tier-1 probe again and would be invisible until physically
+         * removed. The previous code avoided that by dropping the field, which
+         * power-cycles the card back to IDLE -- but that is what made every
+         * false teardown reset the card mid-chain (the source of the 91 1C
+         * responses) and left the next WUPA running on a cold field with only
+         * the ISO minimum settle. HALTed cards DO answer WUPA, which is exactly
+         * why the probe uses WUPA rather than REQA. */
+        uint8_t desel[3] = { 0xC2 };          /* S(DESELECT) request */
+        uint8_t rb[8];
+        uint16_t bits = 0;
+        crc_14a_append(desel, 1);
+        write_register_single(ComIrqReg, 0x7F);
+        pcd_14a_reader_timeout_set(HF14A_4_PRESENCE_TIMEOUT_MS);
+        (void)pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, desel, 3,
+                                            rb, &bits, U8ARR_BIT_LEN(rb));
+        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+        /* Response ignored: an absent card simply times out, and either way the
+         * card is no longer in PROTOCOL. */
     }
     s->active = false;
     s->blk = 0;

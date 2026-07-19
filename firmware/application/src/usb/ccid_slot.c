@@ -70,6 +70,7 @@ void ccid_slot_set_enabled(bool en) {
     hf14a_4_presence_reset();           /* cards may swap while we are not looking */
     if (!en) {                          /* disable: drop the card (main-loop ctx) */
         hf14a_4_session_close(&m_session);
+        hf14a_4_field_off();            /* power decision: stop driving the field */
         m_card_present = false;
     }
 }
@@ -83,6 +84,7 @@ static void presence_lost(void) {
 
 void ccid_slot_radio_shutdown(void) {
     presence_lost();
+    hf14a_4_field_off();                /* power decision: suspend / cable pull */
     /* The host's view is now stale or about to be reset, so record that we do
      * not know what it thinks rather than asserting a value that could collide
      * with the next scan result. */
@@ -109,8 +111,11 @@ bool ccid_slot_presence_changed(bool *present) {
             }
         }
     } else {
-        if (m_session.active) hf14a_4_session_close(&m_session); /* deferred teardown */
-        m_card_present = false;                    /* not our radio -> absent   */
+        if (m_session.active) {
+            hf14a_4_session_close(&m_session);     /* deferred teardown          */
+            hf14a_4_field_off();                   /* the holder owns the radio  */
+        }
+        m_card_present = false;                    /* not our radio -> absent    */
     }
     *present = m_card_present;
     return (m_card_present ? NOTIFY_PRESENT : NOTIFY_ABSENT) != m_notified;

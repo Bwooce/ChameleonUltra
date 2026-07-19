@@ -222,8 +222,7 @@ void ccid_periodic_run(void) {
         /* Safe here (main loop) and only when a poll actually drove the
          * antenna, so the reader is known to be initialised. */
         if (m_ccid_field_up) {
-            ccid_slot_radio_shutdown();
-            pcd_14a_reader_antenna_off();
+            ccid_slot_radio_shutdown();   /* closes the session AND drops the field */
             m_ccid_field_up = false;
         }
         return;

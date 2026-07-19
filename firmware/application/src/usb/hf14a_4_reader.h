@@ -87,6 +87,11 @@ bool hf14a_4_presence(void);
  */
 bool hf14a_4_session_present(hf14a_4_session_t *s);
 
+/** @brief Switch the RF field off. The single antenna-off owner above rc522:
+ *  a POWER decision only (disable / hold / suspend / cable pull), never a
+ *  presence decision -- session teardown uses S(DESELECT) and keeps the field. */
+void hf14a_4_field_off(void);
+
 /** @brief Drop the cached presence classification (call whenever the radio is
  *  handed away or the slot is disabled, so a card swapped out meanwhile is not
  *  reported under the previous card's classification). */
