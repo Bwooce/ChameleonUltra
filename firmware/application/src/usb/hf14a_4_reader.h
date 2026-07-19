@@ -22,6 +22,7 @@
 #define HF14A_4_FSC_DEFAULT 64    /* fallback frame size if ATS omits it      */
 #define HF14A_4_PROBE_TIMEOUT_MS 10 /* idle presence probe: ATQA answers in ~1ms */
 #define HF14A_4_FIELD_SETTLE_MS  5  /* ISO14443-3 5.1 minimum after field on     */
+#define HF14A_4_PRESENCE_TIMEOUT_MS 30 /* R(NAK) presence check; card answers in ~1ms */
 #define HF14A_4_TX_FRAME_MAX 48   /* reliable RC522 TX frame cap (== our FSD); */
                                   /* larger frames near the 64B FIFO are flaky */
 
@@ -74,6 +75,17 @@ void hf14a_4_session_close(hf14a_4_session_t *s);
  * @return true if a 14443-4 card is present.
  */
 bool hf14a_4_presence(void);
+
+/** @brief Is the activated card still in the field?
+ *
+ * Sends an ISO14443-4 R(NAK) and looks for any R-block reply. Transparent to
+ * the session: does not reset the card and does not advance the block number,
+ * so it is safe to interleave with an open session (WUPA is not). Needed
+ * because presence cannot be re-scanned while a session is active.
+ *
+ * @return true if the card answered.
+ */
+bool hf14a_4_session_present(hf14a_4_session_t *s);
 
 /** @brief Drop the cached presence classification (call whenever the radio is
  *  handed away or the slot is disabled, so a card swapped out meanwhile is not

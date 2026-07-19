@@ -340,6 +340,44 @@ bool hf14a_4_presence(void) {
     return s_is_iso4;
 }
 
+bool hf14a_4_session_present(hf14a_4_session_t *s) {
+    if (!s->active) return false;
+
+    /* ISO14443-4 presence check: R(NAK) with the CURRENT block number. A card
+     * still in the field answers with an R-block; a removed one answers nothing.
+     * This is the one interrogation that is transparent to a live session --
+     * unlike WUPA it does not reset the card, and unlike an I-block it does not
+     * advance the block number, so s->blk is deliberately left untouched. */
+    uint8_t rnak[3];
+    uint8_t rbuf[16];
+    uint8_t crc[2];
+
+    rnak[0] = (uint8_t)(0xB2u | (s->blk & 0x01u));   /* R(NAK), block = s->blk */
+    crc_14a_append(rnak, 1);
+
+    write_register_single(ComIrqReg, 0x7F);          /* clear stale RxIRq */
+    pcd_14a_reader_timeout_set(HF14A_4_PRESENCE_TIMEOUT_MS);
+    uint16_t rbits = 0;
+    uint8_t st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, rnak, 3,
+                                               rbuf, &rbits, U8ARR_BIT_LEN(rbuf));
+    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    if (st != STATUS_HF_TAG_OK || rbits < 24u) return false;
+
+    uint16_t rb = rbits / 8u;
+    crc_14a_calculate(rbuf, rb - 2u, crc);
+    if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) return false;
+
+    /* ANY well-formed answer proves the card is still in the field -- do not
+     * require an R-block. Per ISO14443-4 rule 12 a PICC that receives R(NAK)
+     * carrying its OWN current block number re-transmits its last I-block
+     * instead of acknowledging, so demanding an R-block here reports a
+     * perfectly healthy card as gone (observed: presence flapping ~1 s on a
+     * stationary card, tearing down the session every poll). We deliberately
+     * ignore the payload and leave s->blk untouched: the card's block number
+     * does not move for either reply, so the session stays consistent. */
+    return true;
+}
+
 void hf14a_4_session_close(hf14a_4_session_t *s) {
     if (s->active) {
         pcd_14a_reader_antenna_off();

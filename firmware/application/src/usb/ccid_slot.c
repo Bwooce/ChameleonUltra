@@ -8,6 +8,7 @@
  * XfrBlock == one I-block exchange over a kept-alive T=CL session.
  */
 #include "ccid_defs.h"
+#include "app_timer.h"
 #include "hf14a_4_reader.h"
 #include <string.h>
 
@@ -23,6 +24,22 @@ static bool m_ccid_enabled = false;
 static uint8_t m_radio_holders = 0;
 
 static hf14a_4_session_t m_session;
+/* Last APDU exchange, so the R(NAK) presence check never lands in the middle of
+ * a multi-APDU sequence (e.g. a chained DESFire GetVersion). */
+static uint32_t m_last_apdu_tick = 0;
+
+#define CCID_SESSION_IDLE_MS  500
+/* Consecutive unanswered R(NAK)s before we believe the card is gone. This
+ * hardware misses roughly 1 poll in 10 even on a stationary card, so tearing
+ * down on a single miss produced false removals mid-session (measured: presence
+ * dropping after ~1.4 s while the card was held on the reader for 3 s). */
+#define CCID_PRESENCE_MISS_LIMIT  2
+static uint8_t m_session_miss = 0;
+
+static bool session_idle_long_enough(void) {
+    uint32_t now = app_timer_cnt_get();
+    return app_timer_cnt_diff_compute(now, m_last_apdu_tick) >= APP_TIMER_TICKS(CCID_SESSION_IDLE_MS);
+}
 /* Current cached presence, and the last state pushed to the host. */
 static bool m_card_present = false;
 static bool m_notified_present = false;
@@ -57,7 +74,21 @@ bool ccid_slot_presence_changed(bool *present) {
     if (radio_is_ours()) {
         if (!m_session.active) {
             m_card_present = hf14a_4_presence();   /* scan when idle + owned    */
-        }                                          /* active session -> keep on */
+        } else if (session_idle_long_enough()) {
+            /* A session blocks the normal scan, and the host does not power the
+             * card off on SCardDisconnect(SCARD_LEAVE_CARD) -- so without this
+             * presence froze at "present" until something else tore the session
+             * down (~8-10 s), and cards placed in that window were never
+             * reported at all. R(NAK) is transparent to the session. */
+            if (hf14a_4_session_present(&m_session)) {
+                m_session_miss = 0;
+            } else if (++m_session_miss >= CCID_PRESENCE_MISS_LIMIT) {
+                hf14a_4_session_close(&m_session);
+                hf14a_4_presence_reset();
+                m_card_present = false;
+                m_session_miss = 0;
+            }
+        }
     } else {
         if (m_session.active) hf14a_4_session_close(&m_session); /* deferred teardown */
         m_card_present = false;                    /* not our radio -> absent   */
@@ -195,6 +226,7 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         m_card_present = true;
+        m_session_miss = 0;
         uint8_t atr_len = ccid_pseudo_atr_from_ats(m_session.ats, m_session.ats_len,
                                                    &resp[CCID_OFF_DATA]);
         return build_in_header(resp, RDR_TO_PC_DATABLOCK, atr_len, slot, seq,
@@ -219,6 +251,7 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         uint16_t rlen = 0;
+        m_last_apdu_tick = app_timer_cnt_get();   /* defer the R(NAK) check */
         bool ok = hf14a_4_session_apdu(&m_session, &msg[CCID_OFF_DATA], (uint16_t)dlen,
                                        &resp[CCID_OFF_DATA], &rlen,
                                        (uint16_t)(CCID_MAX_APDU_LEN));
