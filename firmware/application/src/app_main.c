@@ -38,6 +38,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "syssleep.h"
 #include "tag_emulation.h"
 #include "usb_main.h"
+#include "usb/ccid_defs.h"
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 #include "settings.h"
@@ -223,6 +224,12 @@ static void timer_button_event_handle(void *arg) {
                 m_is_a_btn_press = true;
                 m_last_btn_press = app_timer_cnt_get();
             }
+        }
+        // Human interaction takes priority over CCID: hold the radio so the
+        // CCID slot yields (reports card removed, stops scanning) while a
+        // button is being used. Released in button_press_process().
+        if (m_is_a_btn_press || m_is_b_btn_press) {
+            ccid_slot_radio_hold(CCID_HOLD_BUTTON, true);
         }
     }
 
@@ -943,6 +950,8 @@ static void button_press_process(void) {
             sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
         }
     }
+    // Button action complete: release the radio back to the CCID slot.
+    ccid_slot_radio_hold(CCID_HOLD_BUTTON, false);
 }
 
 extern bool g_usb_port_opened;
@@ -1053,6 +1062,8 @@ int main(void) {
 
         // Data pack process
         data_frame_process();
+        // CCID interrupt-driven presence scan (no-op unless CCID enabled)
+        ccid_periodic_run();
         // Log print process
         while (NRF_LOG_PROCESS());
         // USB event process

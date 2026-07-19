@@ -129,6 +129,21 @@ class TestCLI(unittest.TestCase):
                r'.*DEADBEEF88')
         self.eval('hw disconnect')
 
+    def test_050_ccid(self):
+        # USB CCID (PC/SC reader) enable flag: toggle over the CLI, verify the
+        # persisted state reads back, and that disabling returns the device to
+        # card emulation (CCID off == normal Chameleon). Ultra only.
+        self.eval('hw connect')
+        self.eval('hw settings ccid -d')                 # known state: disabled
+        self.r('hw settings ccid', r'CCID reader:.*Disabled')
+        self.r('hw mode', r'Tag Emulator')               # disable restores emulation
+        self.r('hw settings ccid -e', r'(changed CCID reader to.*Enabled|already enabled)')
+        self.r('hw settings ccid', r'CCID reader:.*Enabled')
+        self.r('hw settings ccid -d', r'(changed CCID reader to.*Disabled|already disabled)')
+        self.r('hw settings ccid', r'CCID reader:.*Disabled')
+        self.r('hw mode', r'Tag Emulator')               # left in emulation mode
+        self.eval('hw disconnect')
+
 
 if __name__ == '__main__':
     unittest.main()

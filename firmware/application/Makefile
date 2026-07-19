@@ -14,6 +14,9 @@ SRC_FILES += \
   $(PROJ_DIR)/rfid_main.c \
   $(PROJ_DIR)/settings.c \
   $(PROJ_DIR)/usb_main.c \
+  $(PROJ_DIR)/usb/app_usbd_ccid.c \
+  $(PROJ_DIR)/usb/ccid_slot.c \
+  $(PROJ_DIR)/usb/hf14a_4_reader.c \
   $(PROJ_DIR)/rgb_marquee.c \
   $(PROJ_DIR)/bsp/bsp_delay.c \
   $(PROJ_DIR)/bsp/bsp_time.c \
@@ -185,6 +188,7 @@ INC_FOLDERS += \
   ${SRC_COMMON} \
   ${PROJ_DIR}/bsp/ \
   ${PROJ_DIR}/utils/ \
+  ${PROJ_DIR}/usb/ \
   ${PROJ_DIR}/rfid/ \
   ${PROJ_DIR}/rfid/nfctag/ \
   ${PROJ_DIR}/rfid/nfctag/hf \

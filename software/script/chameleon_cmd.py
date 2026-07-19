@@ -1812,6 +1812,27 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(Command.SET_BLE_PAIRING_ENABLE, data)
 
     @expect_response(Status.SUCCESS)
+    def get_ccid_enable(self):
+        """
+        Is the USB CCID (PC/SC smart-card reader) interface enabled? (Ultra only)
+
+        :return: True if the CCID reader is enabled, False otherwise
+        """
+        resp = self.device.send_cmd_sync(Command.GET_CCID_ENABLE)
+        if resp.status == Status.SUCCESS:
+            resp.parsed, = struct.unpack('!?', resp.data)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def set_ccid_enable(self, enabled: bool):
+        """
+        Enable/disable the USB CCID reader. Persisted in flash. When disabled the
+        device returns to card emulation (normal Chameleon behavior).
+        """
+        data = struct.pack('!B', enabled)
+        return self.device.send_cmd_sync(Command.SET_CCID_ENABLE, data)
+
+    @expect_response(Status.SUCCESS)
     def mf1_get_field_off_do_reset(self):
         resp = self.device.send_cmd_sync(Command.MF1_GET_FIELD_OFF_DO_RESET)
         if resp.status == Status.SUCCESS:

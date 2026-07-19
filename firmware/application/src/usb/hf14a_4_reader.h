@@ -1,0 +1,71 @@
+/**
+ * @file hf14a_4_reader.h
+ * @brief Minimal ISO14443-4 (T=CL) reader session API for the CCID slot.
+ *
+ * Wraps the existing proven reader logic (scan_auto + RATS for activation,
+ * and the tcl_apdu_ I-block/chaining/WTX helper in app_cmd.c) behind a
+ * keep-field session so multiple APDUs run against ONE card activation —
+ * required for stateful flows (DESFire auth, GlobalPlatform secure channel)
+ * that cmd 6004's re-select-per-APDU would break.
+ *
+ * v1 implementation is a thin adapter; FU-01 folds this into a shared
+ * PICC/PCD T=CL module.
+ */
+#ifndef HF14A_4_READER_H
+#define HF14A_4_READER_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#define HF14A_4_ATS_MAX     32
+#define HF14A_4_RESP_MAX    512   /* reassembled (chained) response ceiling */
+
+/** @brief One kept-alive T=CL session against a single activated card. */
+typedef struct {
+    bool    active;                    /* card activated, field kept on   */
+    uint8_t blk;                       /* current T=CL block number (0/1) */
+    uint8_t sak;                       /* card SAK                        */
+    uint8_t ats[HF14A_4_ATS_MAX];      /* ATS as returned by RATS         */
+    uint8_t ats_len;                   /* length of ats                   */
+    uint8_t uid[10];
+    uint8_t uid_len;
+} hf14a_4_session_t;
+
+/**
+ * @brief Activate a 14443-4 card: field cycle, select (anticollision), RATS.
+ * Leaves the field ON and the session ready for APDU exchange.
+ * @return true if a 14443-4 (SAK 0x20) card was activated, false otherwise.
+ */
+bool hf14a_4_session_open(hf14a_4_session_t *s);
+
+/**
+ * @brief Exchange one short APDU over the open session (no re-select).
+ * Handles card-side chaining and S(WTX). Command APDU must fit one frame
+ * (v1: <= ~250 bytes minus PCB/CRC; outbound chaining is FU-02).
+ * @param apdu      command APDU bytes (no PCB/CRC)
+ * @param apdu_len  length of command APDU
+ * @param resp      output buffer for the response APDU (no PCB/CRC)
+ * @param resp_len  [out] bytes written to @p resp
+ * @param resp_max  capacity of @p resp
+ * @return true on a valid response, false on transport error / card mute.
+ */
+bool hf14a_4_session_apdu(hf14a_4_session_t *s,
+                          const uint8_t *apdu, uint16_t apdu_len,
+                          uint8_t *resp, uint16_t *resp_len, uint16_t resp_max);
+
+/** @brief Deactivate: drop the RF field and mark the session inactive. */
+void hf14a_4_session_close(hf14a_4_session_t *s);
+
+/**
+ * @brief Lightweight presence probe for GetSlotStatus polling.
+ *
+ * Ensures reader mode + field on, does a quick anticollision scan (no RATS),
+ * and reports whether an ISO14443-4-capable (SAK 0x20) card is in the field.
+ * Leaves the field ON. Must NOT be called while a full session is active
+ * (it would re-select and disrupt an in-progress T=CL exchange).
+ *
+ * @return true if a 14443-4 card is present.
+ */
+bool hf14a_4_presence(void);
+
+#endif /* HF14A_4_READER_H */

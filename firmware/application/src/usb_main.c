@@ -7,6 +7,10 @@
 #include "app_usbd_core.h"
 #include "app_usbd_serial_num.h"
 #include "app_usbd_string_desc.h"
+#include "usb/app_usbd_ccid.h"
+#include "usb/ccid_defs.h"
+#include "settings.h"
+#include "app_timer.h"
 
 #define NRF_LOG_MODULE_NAME usb_cdc
 #include "nrf_log.h"
@@ -33,6 +37,18 @@ APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
                             CDC_ACM_DATA_EPIN,
                             CDC_ACM_DATA_EPOUT,
                             APP_USBD_CDC_COMM_PROTOCOL_AT_V250);
+
+// CCID composite interface (interface 2) — Ultra only (Lite has no HF reader).
+// Endpoints from the free pool (CDC uses EPIN1/EPIN2/EPOUT1): bulk-IN EPIN3,
+// bulk-OUT EPOUT2, intr-IN EPIN4.
+#if defined(PROJECT_CHAMELEON_ULTRA)
+#define CCID_INTERFACE          2
+APP_USBD_CCID_GLOBAL_DEF(m_app_ccid,
+                         CCID_INTERFACE,
+                         NRF_DRV_USBD_EPIN3,
+                         NRF_DRV_USBD_EPOUT2,
+                         NRF_DRV_USBD_EPIN4);
+#endif
 
 // USB DEFINES END
 
@@ -146,6 +162,36 @@ void usb_cdc_init(void) {
     app_usbd_class_inst_t const *class_cdc_acm = app_usbd_cdc_acm_class_inst_get(&m_app_cdc_acm);
     ret = app_usbd_class_append(class_cdc_acm);
     APP_ERROR_CHECK(ret);
+
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    // Composite: append the CCID smart-card-reader interface alongside CDC.
+    ret = app_usbd_class_append(app_usbd_ccid_class_inst_get(&m_app_ccid));
+    APP_ERROR_CHECK(ret);
+
+    // CCID reader is off by default (normal Chameleon behavior); the user opts
+    // in via DATA_CMD_SET_CCID_ENABLE, persisted in settings. Settings are
+    // loaded before usb_cdc_init() (see app_main), so this reflects saved state.
+    ccid_slot_set_enabled(settings_get_ccid_enable());
+#endif
+}
+
+// Interrupt-driven CCID presence: scan the field on an interval (main-loop
+// context, so the blocking RF scan is safe) and push RDR_to_PC_NotifySlotChange
+// only when presence changes. Called from the main loop.
+void ccid_periodic_run(void) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    if (!g_usb_connected) return;
+    static uint32_t last_tick = 0;
+    uint32_t now = app_timer_cnt_get();
+    if (app_timer_cnt_diff_compute(now, last_tick) < APP_TIMER_TICKS(300)) return;
+    last_tick = now;
+
+    bool present;
+    if (ccid_slot_presence_changed(&present)) {
+        app_usbd_ccid_notify_slot_change(&m_app_ccid, present);
+        ccid_slot_mark_notified();
+    }
+#endif
 }
 
 void usb_cdc_write(const void *p_buf, uint16_t length) {
