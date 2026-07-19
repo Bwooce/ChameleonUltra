@@ -349,7 +349,12 @@ bool hf14a_4_session_present(hf14a_4_session_t *s) {
      * unlike WUPA it does not reset the card, and unlike an I-block it does not
      * advance the block number, so s->blk is deliberately left untouched. */
     uint8_t rnak[3];
-    uint8_t rbuf[16];
+    /* Must fit a full I-BLOCK, not a 3-byte R(ACK): per ISO14443-4 rule 12 a
+     * PICC receiving R(NAK) carrying its own block number RE-TRANSMITS its last
+     * I-block. Sized for an R(ACK), the driver rejected the reply as an overflow
+     * (STATUS_HF_ERR_STAT), so a card that answered perfectly read as absent --
+     * deterministically, defeating any miss-hysteresis. */
+    uint8_t rbuf[288];
     uint8_t crc[2];
 
     rnak[0] = (uint8_t)(0xB2u | (s->blk & 0x01u));   /* R(NAK), block = s->blk */
