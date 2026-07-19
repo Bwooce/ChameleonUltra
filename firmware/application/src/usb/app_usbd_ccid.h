@@ -90,7 +90,9 @@ app_usbd_ccid_class_inst_get(app_usbd_ccid_t const *p_ccid) {
 }
 
 /** @brief Push RDR_to_PC_NotifySlotChange on the interrupt-IN endpoint. */
-void app_usbd_ccid_notify_slot_change(app_usbd_ccid_t const *p_ccid, bool card_present);
+/** @return true if the notification was queued; false if one was already in
+ *  flight (the caller must retry and must not mark the state as notified). */
+bool app_usbd_ccid_notify_slot_change(app_usbd_ccid_t const *p_ccid, bool card_present);
 
 #ifdef __cplusplus
 }

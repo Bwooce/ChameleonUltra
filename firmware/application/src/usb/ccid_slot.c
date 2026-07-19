@@ -34,12 +34,17 @@ static inline bool radio_is_ours(void) {
 void ccid_slot_radio_hold(uint8_t who, bool held) {
     if (held) m_radio_holders |= who;
     else      m_radio_holders &= (uint8_t)~who;
+    /* Whoever had the radio may have left a different card in the field (and
+     * the CDC hooks switch the antenna off), so the cached classification is no
+     * longer trustworthy either way. */
+    hf14a_4_presence_reset();
 }
 /* Back-compat wrapper for the CDC reader/attack hooks. */
 void ccid_slot_set_cdc_lock(bool locked) { ccid_slot_radio_hold(CCID_HOLD_CDC, locked); }
 
 void ccid_slot_set_enabled(bool en) {
     m_ccid_enabled = en;
+    hf14a_4_presence_reset();           /* cards may swap while we are not looking */
     if (!en) {                          /* disable: drop the card (main-loop ctx) */
         hf14a_4_session_close(&m_session);
         m_card_present = false;
@@ -183,6 +188,10 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
         if (!radio_available || !hf14a_4_session_open(&m_session)) {
             m_session.active = false;
             m_card_present = false;
+            /* We announced a card the host could not activate: re-classify next
+             * poll rather than re-announcing the same card from a stale cache
+             * (which would flap present/absent every poll). */
+            hf14a_4_presence_reset();
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         m_card_present = true;

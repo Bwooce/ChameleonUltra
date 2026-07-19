@@ -11,6 +11,8 @@
 #include "hf14a_4_reader.h"
 #include <string.h>
 
+/* Ultra only: the Makefile builds this file solely for the Ultra target
+ * (Lite has no MFRC522 HF reader). The guard is belt-and-braces. */
 #if defined(PROJECT_CHAMELEON_ULTRA)
 
 #include "rfid_main.h"
@@ -124,14 +126,22 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
     crc_14a_calculate(rbuf, rb - 2u, crc);
     if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) return false;
 
+    /* NOTE on the overflow bail-outs below: erroring beats silently truncating
+     * (a short APDU response reported as success is corrupt data), but we
+     * cannot simply return -- blk has already been toggled and the card is
+     * mid-chain waiting for an R(ACK) it will never get, so every later APDU on
+     * this session would fail. Dropping s->active makes ccid_slot_process()
+     * answer ICC_MUTE and forces the host to re-power the card, which
+     * re-activates it cleanly. */
     s->blk ^= 1;
     uint8_t  resp_pcb = rbuf[0];
     uint16_t out = 0;
-    /* rb is one T=CL frame, bounded by the card FSC (<= 256) and by rbuf, so
-     * rb - 3 (PCB + 2-byte CRC stripped) always fits in a uint8_t. */
-    uint8_t  dlen = (uint8_t)(rb - 3u);
+    /* uint16_t, not uint8_t: nothing actually clamps rb to the card FSC -- the
+     * transfer is bounded only by rbuf[288] -- so a card sending a >258 byte
+     * frame would wrap a uint8_t and silently discard most of the payload. */
+    uint16_t dlen = (uint16_t)(rb - 3u);
     if (dlen > 0) {
-        if (out + dlen > resp_max) { *resp_len = 0; return false; } /* response would overflow */
+        if (out + dlen > resp_max) { *resp_len = 0; s->active = false; return false; } /* overflow: kill the session, see note */
         memcpy(&resp[out], &rbuf[1], dlen);
         out += dlen;
     }
@@ -157,9 +167,9 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                 crc_14a_calculate(rbuf, rb - 2u, crc);
                 if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
                 resp_pcb = rbuf[0];
-                dlen = (uint8_t)(rb - 3u);
+                dlen = (uint16_t)(rb - 3u);
                 if (dlen > 0) {
-                    if (out + dlen > resp_max) { *resp_len = 0; return false; } /* response would overflow */
+                    if (out + dlen > resp_max) { *resp_len = 0; s->active = false; return false; } /* overflow: kill the session, see note */
                     memcpy(&resp[out], &rbuf[1], dlen);
                     out += dlen;
                 }
@@ -183,9 +193,9 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         crc_14a_calculate(rbuf, rb - 2u, crc);
         if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
         resp_pcb = rbuf[0];
-        dlen = (uint8_t)(rb - 3u);
+        dlen = (uint16_t)(rb - 3u);
         if (dlen > 0) {
-            if (out + dlen > resp_max) { *resp_len = 0; return false; } /* response would overflow */
+            if (out + dlen > resp_max) { *resp_len = 0; s->active = false; return false; } /* overflow: kill the session, see note */
             memcpy(&resp[out], &rbuf[1], dlen);
             out += dlen;
         }
@@ -227,11 +237,30 @@ static bool hf14a_4_quick_probe(uint8_t atqa_out[2]) {
     return true;
 }
 
-/* Whatever is currently in the field has already been classified, so repeat
- * polls need only the cheap probe. Cleared as soon as the field goes empty. */
-static bool    s_classified = false;
-static bool    s_is_iso4    = false;
-static uint8_t s_atqa[2]    = {0};
+/* Classification cache for whatever is currently in the field, so repeat polls
+ * need only the cheap probe. Only ever set from a SUCCESSFUL tier-2 scan --
+ * caching a failed scan would latch a transient RF error (off-centre card,
+ * anticollision collision, card still settling) into a permanent "not a
+ * smartcard" verdict that survives until the card physically leaves the field.
+ * s_miss gives one poll of hysteresis so a single missed WUPA does not report
+ * a removal; s_unselectable throttles a card that answers WUPA but will not
+ * select, so it costs one full scan per second rather than one per poll. */
+static bool    s_classified   = false;
+static bool    s_is_iso4      = false;
+static uint8_t s_atqa[2]      = {0};
+static uint8_t s_miss         = 0;
+static uint8_t s_unselectable = 0;
+
+#define HF14A_4_MISS_LIMIT        2   /* consecutive probe misses => absent    */
+#define HF14A_4_UNSELECTABLE_SKIP 3   /* polls to skip after a failed scan     */
+
+void hf14a_4_presence_reset(void) {
+    s_classified   = false;
+    s_is_iso4      = false;
+    s_miss         = 0;
+    s_unselectable = 0;
+    memset(s_atqa, 0, sizeof(s_atqa));
+}
 
 bool hf14a_4_presence(void) {
     reader_mode_enter();               /* idempotent: no-op if already reader  */
@@ -240,10 +269,15 @@ bool hf14a_4_presence(void) {
      * ms instead of ~2 s. */
     uint8_t atqa[2] = {0};
     if (!hf14a_4_quick_probe(atqa)) {
-        s_classified = false;
-        s_is_iso4    = false;
+        /* Hysteresis: one miss is not a removal. A single WUPA can be lost to a
+         * cold field (the antenna is switched off by session_close and by the
+         * CDC reader hooks) or to momentary detuning, and reporting absent
+         * would tear down the host's connection for no reason. */
+        if (s_classified && ++s_miss < HF14A_4_MISS_LIMIT) return s_is_iso4;
+        hf14a_4_presence_reset();
         return false;
     }
+    s_miss = 0;
 
     /* Same card still sitting there -- no need to re-run the costly scan. The
      * ATQA guard catches a swap to a different card type that happens fast
@@ -251,6 +285,10 @@ bool hf14a_4_presence(void) {
      * previous card's classification). Same ATQA does not prove same card, but
      * a changed one definitely proves a different card, and it is free here. */
     if (s_classified && memcmp(atqa, s_atqa, sizeof(atqa)) == 0) return s_is_iso4;
+
+    /* Something is there but unclassified. Back off if it keeps failing to
+     * select, so an un-selectable card does not cost a full scan every poll. */
+    if (s_unselectable && --s_unselectable) return false;
 
     /* Tier 2: newly arrived -- pay for the full scan, since confirming an
      * ISO14443-4 card needs the SAK (anticollision + SELECT). */
@@ -266,8 +304,21 @@ bool hf14a_4_presence(void) {
      * achieves the same for far less time. */
     pcd_14a_reader_fast_halt_tag();
 
-    s_is_iso4    = (status == STATUS_HF_TAG_OK) && (tag.sak & 0x20);
-    s_classified = true;
+    if (status != STATUS_HF_TAG_OK) {
+        /* Transient RF failure -- do NOT cache it, or a card that merely landed
+         * badly stays invisible even after it is nudged into place. */
+        s_unselectable = HF14A_4_UNSELECTABLE_SKIP;
+        return false;
+    }
+
+    /* Must match what session_open() will accept, otherwise we announce a card
+     * the subsequent IccPowerOn cannot activate: it requires an ATS as well as
+     * the ISO14443-4 SAK bit (scan_once tolerates a card that claims 14443-4
+     * but NAKs RATS, leaving ats_len = 0). Mismatch => endless present/absent
+     * flapping as each power-on fails. */
+    s_is_iso4      = (tag.sak & 0x20) && (tag.ats_len != 0);
+    s_classified   = true;
+    s_unselectable = 0;
     memcpy(s_atqa, atqa, sizeof(s_atqa));
     return s_is_iso4;
 }
@@ -280,18 +331,5 @@ void hf14a_4_session_close(hf14a_4_session_t *s) {
     s->blk = 0;
 }
 
-#else  /* !PROJECT_CHAMELEON_ULTRA */
-
-/* Lite has no MFRC522 HF reader: stubs so the CCID slot links but never
- * activates a card. CCID is not exposed on Lite anyway (see usb_main.c). */
-bool hf14a_4_session_open(hf14a_4_session_t *s) { (void)s; return false; }
-bool hf14a_4_presence(void) { return false; }
-bool hf14a_4_session_apdu(hf14a_4_session_t *s, const uint8_t *apdu, uint16_t apdu_len,
-                          uint8_t *resp, uint16_t *resp_len, uint16_t resp_max) {
-    (void)s; (void)apdu; (void)apdu_len; (void)resp; (void)resp_max;
-    if (resp_len) *resp_len = 0;
-    return false;
-}
-void hf14a_4_session_close(hf14a_4_session_t *s) { (void)s; }
-
 #endif /* PROJECT_CHAMELEON_ULTRA */
+

@@ -290,7 +290,8 @@ static ret_code_t ccid_event_handler(app_usbd_class_inst_t const *p_inst,
         memset(p_ctx, 0, sizeof(*p_ctx));
         return NRF_SUCCESS;
     case APP_USBD_EVT_DRV_RESET:
-        p_ctx->tx_in_flight = false;
+        p_ctx->tx_in_flight  = false;
+        p_ctx->notify_pending = false;  /* in-flight IN transfers are gone */
         p_ctx->rx_len = 0;
         return NRF_SUCCESS;
     case APP_USBD_EVT_DRV_SETUP:
@@ -306,7 +307,8 @@ static ret_code_t ccid_event_handler(app_usbd_class_inst_t const *p_inst,
         return NRF_SUCCESS;
     case APP_USBD_EVT_STOPPED:
     case APP_USBD_EVT_POWER_REMOVED:
-        p_ctx->tx_in_flight = false;
+        p_ctx->tx_in_flight  = false;
+        p_ctx->notify_pending = false;  /* else slot-change notifies stop forever */
         return NRF_SUCCESS;
     default:
         return NRF_ERROR_NOT_SUPPORTED;
@@ -319,10 +321,13 @@ const app_usbd_class_methods_t app_usbd_ccid_class_methods = {
 };
 
 /* ---- interrupt-IN slot-change notification -------------------------- */
-void app_usbd_ccid_notify_slot_change(app_usbd_ccid_t const *p_ccid, bool card_present) {
+bool app_usbd_ccid_notify_slot_change(app_usbd_ccid_t const *p_ccid, bool card_present) {
     app_usbd_ccid_ctx_t *p_ctx = ccid_ctx_get(p_ccid);
     app_usbd_class_inst_t const *p_inst = &p_ccid->base;
-    if (p_ctx->notify_pending) return;   /* previous notification still in flight */
+    /* Report failure rather than swallowing it: the caller must NOT record the
+     * state as notified, or a change dropped here is never resent and the host
+     * keeps the opposite view of the slot forever. */
+    if (p_ctx->notify_pending) return false;   /* previous notification in flight */
     /* RDR_to_PC_NotifySlotChange: bMessageType + bmSlotICCState (slot 0).
      * bit0 = slot 0 present, bit1 = state changed since last notify. */
     static uint8_t note[2];
@@ -332,5 +337,7 @@ void app_usbd_ccid_notify_slot_change(app_usbd_ccid_t const *p_ccid, bool card_p
     NRF_DRV_USBD_TRANSFER_IN(xfer, note, sizeof(note));
     if (app_usbd_ep_transfer(INTR_IN_EP(p_inst), &xfer) != NRF_SUCCESS) {
         p_ctx->notify_pending = false;   /* let the caller retry next cycle */
+        return false;
     }
+    return true;
 }

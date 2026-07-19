@@ -238,7 +238,9 @@ static data_frame_tx_t *cmd_processor_set_ccid_enable(uint16_t cmd, uint16_t sta
     bool enable = (data[0] != 0);
     if (settings_get_ccid_enable() != enable) {
         settings_set_ccid_enable(enable);
-        settings_save_config();        // persist only on change (avoid flash wear)
+        settings_save_config();        // (settings_save_config already CRC-gates the
+                                       //  write; the guard is so a button-disabled
+                                       //  runtime state can be re-enabled without churn)
     }
     ccid_slot_set_enabled(enable);     // always apply the runtime state
     if (!enable) {

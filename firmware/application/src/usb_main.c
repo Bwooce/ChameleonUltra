@@ -42,12 +42,20 @@ APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
 // Endpoints from the free pool (CDC uses EPIN1/EPIN2/EPOUT1): bulk-IN EPIN3,
 // bulk-OUT EPOUT2, intr-IN EPIN4.
 #if defined(PROJECT_CHAMELEON_ULTRA)
+#include "rfid/reader/hf/rc522.h"      /* antenna control on USB suspend */
 #define CCID_INTERFACE          2
 APP_USBD_CCID_GLOBAL_DEF(m_app_ccid,
                          CCID_INTERFACE,
                          NRF_DRV_USBD_EPIN3,
                          NRF_DRV_USBD_EPOUT2,
                          NRF_DRV_USBD_EPIN4);
+
+/* Set from the USB event handler, read by ccid_periodic_run(): the SDK leaves
+ * app_usbd_core_state_get() == Configured across a suspend, so we track it. */
+static volatile bool m_usb_suspended = false;
+/* True once a presence poll has driven the antenna, so we know the reader is
+ * initialised and it is safe to switch the field off on suspend. */
+static bool m_ccid_field_up = false;
 #endif
 
 // USB DEFINES END
@@ -102,10 +110,26 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
     switch (event) {
         case APP_USBD_EVT_DRV_SUSPEND:
             NRF_LOG_INFO("USB SUSPEND");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            /* The SDK does not change app_usbd_core_state_get() on suspend, so
+             * the CCID scan gate would stay open: without this we keep driving
+             * the RF field (orders of magnitude over the USB suspend current
+             * budget) and any presence change queues an interrupt-IN transfer
+             * that cannot complete, latching notify_pending.
+             *
+             * ONLY set the flag here. This handler can run before the RC522 is
+             * initialised, and the antenna calls are raw SPI writes with no
+             * init check -- touching the radio here hardfaults the device. The
+             * field is dropped from the main loop instead, see ccid_periodic_run. */
+            m_usb_suspended = true;
+#endif
             break;
 
         case APP_USBD_EVT_DRV_RESUME:
             NRF_LOG_INFO("USB RESUME");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            m_usb_suspended = false;
+#endif
             break;
 
         case APP_USBD_EVT_STARTED:
@@ -187,6 +211,15 @@ void ccid_periodic_run(void) {
      * queue so the device misses the host's SETUP requests and never enumerates.
      * With ccid_enable persisted true that made the device invisible on USB from
      * boot. Only scan once the host has actually configured us. */
+    if (m_usb_suspended) {
+        /* Safe here (main loop, and only if a previous poll already ran
+         * reader_mode_enter()/antenna_on(), so the SPI handle is live). */
+        if (m_ccid_field_up) {
+            pcd_14a_reader_antenna_off();
+            m_ccid_field_up = false;
+        }
+        return;
+    }
     if (app_usbd_core_state_get() != APP_USBD_STATE_Configured) return;
     if (!g_usb_connected) return;
     static uint32_t last_tick = 0;
@@ -195,9 +228,14 @@ void ccid_periodic_run(void) {
     last_tick = now;
 
     bool present;
+    m_ccid_field_up = true;      /* the poll below drives the antenna */
     if (ccid_slot_presence_changed(&present)) {
-        app_usbd_ccid_notify_slot_change(&m_app_ccid, present);
-        ccid_slot_mark_notified();
+        /* Only record it as notified if the notification actually went out --
+         * otherwise a dropped change is never resent and the host's view of the
+         * slot stays wrong for good. */
+        if (app_usbd_ccid_notify_slot_change(&m_app_ccid, present)) {
+            ccid_slot_mark_notified();
+        }
     }
 #endif
 }

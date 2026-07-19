@@ -21,7 +21,7 @@
 #define HF14A_4_CMD_MAX     261   /* command APDU ceiling (matches CCID short) */
 #define HF14A_4_FSC_DEFAULT 64    /* fallback frame size if ATS omits it      */
 #define HF14A_4_PROBE_TIMEOUT_MS 10 /* idle presence probe: ATQA answers in ~1ms */
-#define HF14A_4_FIELD_SETTLE_MS  3  /* let the RF field power the card up        */
+#define HF14A_4_FIELD_SETTLE_MS  5  /* ISO14443-3 5.1 minimum after field on     */
 #define HF14A_4_TX_FRAME_MAX 48   /* reliable RC522 TX frame cap (== our FSD); */
                                   /* larger frames near the 64B FIFO are flaky */
 
@@ -74,5 +74,10 @@ void hf14a_4_session_close(hf14a_4_session_t *s);
  * @return true if a 14443-4 card is present.
  */
 bool hf14a_4_presence(void);
+
+/** @brief Drop the cached presence classification (call whenever the radio is
+ *  handed away or the slot is disabled, so a card swapped out meanwhile is not
+ *  reported under the previous card's classification). */
+void hf14a_4_presence_reset(void);
 
 #endif /* HF14A_4_READER_H */
