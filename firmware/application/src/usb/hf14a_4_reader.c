@@ -228,6 +228,14 @@ static bool hf14a_4_quick_probe(uint8_t atqa_out[2]) {
     pcd_14a_reader_antenna_on();
     bsp_delay_ms(HF14A_4_FIELD_SETTLE_MS);
 
+    /* Clear stale RxIRq before transmit (bytes_transfer only clears Set1), as
+     * every other exchange in this file does. Without it the probe can latch a
+     * leftover interrupt from an earlier transfer and report an ATQA that never
+     * arrived -- i.e. a removed card keeps reading as present, so removal goes
+     * unreported and the next card placed is never announced to the host. The
+     * old field-cycling probe hid this; a lean single-shot probe must not. */
+    write_register_single(ComIrqReg, 0x7F);
+
     pcd_14a_reader_timeout_set(HF14A_4_PROBE_TIMEOUT_MS);
     uint8_t status = pcd_14a_reader_bits_transfer(wupa, 7, NULL, resp, NULL, &len,
                                                   U8ARR_BIT_LEN(resp));
@@ -249,16 +257,19 @@ static bool    s_classified   = false;
 static bool    s_is_iso4      = false;
 static uint8_t s_atqa[2]      = {0};
 static uint8_t s_miss         = 0;
-static uint8_t s_unselectable = 0;
+static uint8_t s_scan_fails   = 0;   /* consecutive tier-2 failures */
+static uint8_t s_backoff      = 0;   /* polls left to skip          */
 
 #define HF14A_4_MISS_LIMIT        2   /* consecutive probe misses => absent    */
-#define HF14A_4_UNSELECTABLE_SKIP 3   /* polls to skip after a failed scan     */
+#define HF14A_4_SCAN_FAIL_LIMIT   4   /* failures before we start backing off  */
+#define HF14A_4_UNSELECTABLE_SKIP 3   /* polls to skip once backing off        */
 
 void hf14a_4_presence_reset(void) {
     s_classified   = false;
     s_is_iso4      = false;
-    s_miss         = 0;
-    s_unselectable = 0;
+    s_miss       = 0;
+    s_scan_fails = 0;
+    s_backoff    = 0;
     memset(s_atqa, 0, sizeof(s_atqa));
 }
 
@@ -286,9 +297,11 @@ bool hf14a_4_presence(void) {
      * a changed one definitely proves a different card, and it is free here. */
     if (s_classified && memcmp(atqa, s_atqa, sizeof(atqa)) == 0) return s_is_iso4;
 
-    /* Something is there but unclassified. Back off if it keeps failing to
-     * select, so an un-selectable card does not cost a full scan every poll. */
-    if (s_unselectable && --s_unselectable) return false;
+    /* Something is there but unclassified. Only back off once it has failed
+     * repeatedly: a card being placed by hand routinely fails its first scans
+     * while it settles into the field, and skipping polls then makes arrival
+     * detection miss real cards. Stay responsive first, throttle later. */
+    if (s_backoff) { s_backoff--; return false; }
 
     /* Tier 2: newly arrived -- pay for the full scan, since confirming an
      * ISO14443-4 card needs the SAK (anticollision + SELECT). */
@@ -306,8 +319,11 @@ bool hf14a_4_presence(void) {
 
     if (status != STATUS_HF_TAG_OK) {
         /* Transient RF failure -- do NOT cache it, or a card that merely landed
-         * badly stays invisible even after it is nudged into place. */
-        s_unselectable = HF14A_4_UNSELECTABLE_SKIP;
+         * badly stays invisible even after it is nudged into place. Retry every
+         * poll for the first few, then throttle a genuinely un-selectable card. */
+        if (++s_scan_fails >= HF14A_4_SCAN_FAIL_LIMIT) {
+            s_backoff = HF14A_4_UNSELECTABLE_SKIP;
+        }
         return false;
     }
 
@@ -316,9 +332,10 @@ bool hf14a_4_presence(void) {
      * the ISO14443-4 SAK bit (scan_once tolerates a card that claims 14443-4
      * but NAKs RATS, leaving ats_len = 0). Mismatch => endless present/absent
      * flapping as each power-on fails. */
-    s_is_iso4      = (tag.sak & 0x20) && (tag.ats_len != 0);
-    s_classified   = true;
-    s_unselectable = 0;
+    s_is_iso4    = (tag.sak & 0x20) && (tag.ats_len != 0);
+    s_classified = true;
+    s_scan_fails = 0;
+    s_backoff    = 0;
     memcpy(s_atqa, atqa, sizeof(s_atqa));
     return s_is_iso4;
 }
