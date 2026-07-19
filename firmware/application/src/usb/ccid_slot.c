@@ -67,6 +67,22 @@ void ccid_slot_set_enabled(bool en) {
         m_card_present = false;
     }
 }
+/* One teardown, so every caller agrees what "the card went away" means. */
+static void presence_lost(void) {
+    hf14a_4_session_close(&m_session);
+    hf14a_4_presence_reset();
+    m_card_present = false;
+    m_session_miss = 0;
+}
+
+void ccid_slot_radio_shutdown(void) {
+    presence_lost();
+    /* Force the next presence change to be re-notified: after a suspend, cable
+     * pull or de-configure the host's view is stale or reset, and a matching
+     * m_notified_present would suppress the notification forever. */
+    m_notified_present = true;
+}
+
 bool ccid_slot_card_present(void) { return m_card_present; }
 bool ccid_slot_is_enabled(void)   { return m_ccid_enabled; }
 
@@ -83,10 +99,7 @@ bool ccid_slot_presence_changed(bool *present) {
             if (hf14a_4_session_present(&m_session)) {
                 m_session_miss = 0;
             } else if (++m_session_miss >= CCID_PRESENCE_MISS_LIMIT) {
-                hf14a_4_session_close(&m_session);
-                hf14a_4_presence_reset();
-                m_card_present = false;
-                m_session_miss = 0;
+                presence_lost();
             }
         }
     } else {
@@ -98,6 +111,15 @@ bool ccid_slot_presence_changed(bool *present) {
 }
 
 void ccid_slot_mark_notified(void) { m_notified_present = m_card_present; }
+
+void ccid_slot_invalidate_notify(void) {
+    /* After a bus reset the host's slot state is unknown, but we still believed
+     * we had told it -- so presence_changed() reported no change and a card
+     * sitting on the reader across re-enumeration was never announced. Masked
+     * on macOS because it also polls GetSlotStatus; a notification-only host
+     * would simply never see the card. */
+    m_notified_present = !m_card_present;
+}
 
 /**
  * @brief Build the PC/SC Part 3 contactless pseudo-ATR from a card ATS.
@@ -270,10 +292,7 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
              * a lifted card every ~300 ms re-armed the 500 ms idle guard forever,
              * so R(NAK) never ran and presence stayed pinned at "present". */
             if (++m_session_miss >= CCID_PRESENCE_MISS_LIMIT) {
-                hf14a_4_session_close(&m_session);
-                hf14a_4_presence_reset();
-                m_card_present = false;
-                m_session_miss = 0;
+                presence_lost();
             }
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }

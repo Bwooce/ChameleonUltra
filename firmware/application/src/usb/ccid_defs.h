@@ -127,6 +127,13 @@ void ccid_slot_set_enabled(bool en);
  *  CCID reports card-removed and stops scanning/relaying while any hold is set. */
 void ccid_slot_radio_hold(uint8_t who, bool held);
 
+/** @brief Drop the card, the session and the RF field (suspend, cable pull,
+ *  de-configure), and force the next presence change to be re-notified. */
+void ccid_slot_radio_shutdown(void);
+
+/** @brief Forget what we told the host (call on USB bus reset). */
+void ccid_slot_invalidate_notify(void);
+
 /** @brief Back-compat: hold/release the CDC radio lock (Q5). */
 void ccid_slot_set_cdc_lock(bool locked);
 

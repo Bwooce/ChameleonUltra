@@ -296,6 +296,12 @@ bool hf14a_4_presence(void) {
      * previous card's classification). Same ATQA does not prove same card, but
      * a changed one definitely proves a different card, and it is free here. */
     if (s_classified && memcmp(atqa, s_atqa, sizeof(atqa)) == 0) return s_is_iso4;
+    /* Different ATQA => definitely a different card. Drop the cache NOW: if the
+     * rescan below fails we would otherwise keep reporting the PREVIOUS card's
+     * classification, and a repeatedly-unselectable replacement would hold that
+     * stale verdict indefinitely. */
+    s_classified = false;
+    s_is_iso4    = false;
 
     /* Something is there but unclassified. Only back off once it has failed
      * repeatedly: a card being placed by hand routinely fails its first scans
@@ -321,7 +327,9 @@ bool hf14a_4_presence(void) {
         /* Transient RF failure -- do NOT cache it, or a card that merely landed
          * badly stays invisible even after it is nudged into place. Retry every
          * poll for the first few, then throttle a genuinely un-selectable card. */
-        if (++s_scan_fails >= HF14A_4_SCAN_FAIL_LIMIT) {
+        if (s_scan_fails < 255) s_scan_fails++;   /* clamp: wrapping would
+                                                   * disengage the back-off */
+        if (s_scan_fails >= HF14A_4_SCAN_FAIL_LIMIT) {
             s_backoff = HF14A_4_UNSELECTABLE_SKIP;
         }
         return false;

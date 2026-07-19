@@ -293,6 +293,9 @@ static ret_code_t ccid_event_handler(app_usbd_class_inst_t const *p_inst,
         p_ctx->tx_in_flight  = false;
         p_ctx->notify_pending = false;  /* in-flight IN transfers are gone */
         p_ctx->rx_len = 0;
+        /* The host's slot state is reset too, so forget what we think we told
+         * it -- otherwise a card already on the reader is never announced. */
+        ccid_slot_invalidate_notify();
         return NRF_SUCCESS;
     case APP_USBD_EVT_DRV_SETUP:
         return ccid_setup_handler(p_inst, (app_usbd_setup_evt_t const *)p_event);

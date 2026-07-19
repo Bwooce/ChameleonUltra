@@ -211,17 +211,23 @@ void ccid_periodic_run(void) {
      * queue so the device misses the host's SETUP requests and never enumerates.
      * With ccid_enable persisted true that made the device invisible on USB from
      * boot. Only scan once the host has actually configured us. */
-    if (m_usb_suspended) {
-        /* Safe here (main loop, and only if a previous poll already ran
-         * reader_mode_enter()/antenna_on(), so the SPI handle is live). */
+    /* ONE predicate, ONE exit. Previously only the suspend path dropped the
+     * field, so a cable pull (POWER_REMOVED clears g_usb_connected with no
+     * SUSPEND event) or any exit from Configured returned with the RF carrier
+     * still energised -- permanently, off the battery -- and any open session
+     * still active. */
+    bool may_scan = !m_usb_suspended && g_usb_connected &&
+                    (app_usbd_core_state_get() == APP_USBD_STATE_Configured);
+    if (!may_scan) {
+        /* Safe here (main loop) and only when a poll actually drove the
+         * antenna, so the reader is known to be initialised. */
         if (m_ccid_field_up) {
+            ccid_slot_radio_shutdown();
             pcd_14a_reader_antenna_off();
             m_ccid_field_up = false;
         }
         return;
     }
-    if (app_usbd_core_state_get() != APP_USBD_STATE_Configured) return;
-    if (!g_usb_connected) return;
     static uint32_t last_tick = 0;
     uint32_t now = app_timer_cnt_get();
     if (app_timer_cnt_diff_compute(now, last_tick) < APP_TIMER_TICKS(300)) return;
