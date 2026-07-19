@@ -18,7 +18,6 @@
 #include "rfid/reader/hf/rc522.h"
 
 #define TCL_RESP_TIMEOUT_MS     600
-#define TCL_MAX_CMD_APDU        250   /* one-frame command APDU (FU-02 chains) */
 
 bool hf14a_4_session_open(hf14a_4_session_t *s) {
     memset(s, 0, sizeof(*s));
@@ -52,6 +51,16 @@ bool hf14a_4_session_open(hf14a_4_session_t *s) {
     s->ats_len = tag.ats_len > HF14A_4_ATS_MAX ? HF14A_4_ATS_MAX : tag.ats_len;
     memcpy(s->ats, tag.ats, s->ats_len);
     s->blk = 0;
+
+    /* FSC = max bytes the card accepts per frame, from FSCI (low nibble of the
+     * ATS format byte T0, which follows the length byte). Table per ISO14443-4. */
+    s->fsc = HF14A_4_FSC_DEFAULT;
+    if (s->ats_len >= 2) {
+        static const uint16_t fsc_tbl[] = {16, 24, 32, 40, 48, 64, 96, 128, 256};
+        uint8_t fsci = s->ats[1] & 0x0F;
+        if (fsci < (sizeof(fsc_tbl) / sizeof(fsc_tbl[0]))) s->fsc = fsc_tbl[fsci];
+    }
+
     s->active = true;                  /* leave field ON for APDU exchange     */
     return true;
 }
@@ -60,17 +69,47 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                           const uint8_t *apdu, uint16_t apdu_len,
                           uint8_t *resp, uint16_t *resp_len, uint16_t resp_max) {
     *resp_len = 0;
-    if (!s->active || apdu_len == 0 || apdu_len > TCL_MAX_CMD_APDU) return false;
+    if (!s->active || apdu_len == 0 || apdu_len > HF14A_4_CMD_MAX) return false;
 
-    uint8_t abuf[3 + TCL_MAX_CMD_APDU];  /* PCB + APDU + CRC */
+    uint8_t abuf[3 + DEF_FIFO_LENGTH];   /* one frame: PCB + payload + CRC */
     uint8_t rbuf[288];
     uint8_t crc[2];
 
-    /* Build I-block: PCB(I, block_num) + APDU + CRC. */
+    /* Per-frame payload = min(card FSC, reliable RC522 TX frame) - PCB - CRC.
+     * The 64B FIFO is unreliable near its limit, so cap well below it and let
+     * chaining carry the rest. */
+    uint16_t frame_cap = (s->fsc && s->fsc < HF14A_4_TX_FRAME_MAX) ? s->fsc : HF14A_4_TX_FRAME_MAX;
+    uint16_t chunk_max = frame_cap - 3;
+    if (chunk_max < 1) chunk_max = 1;
+
+    /* Outbound (reader->card) chaining: send all but the last chunk as chained
+     * I-blocks (PCB bit4 = 0x10 set), each acknowledged by an R(ACK). */
+    uint16_t off = 0;
+    while ((uint16_t)(apdu_len - off) > chunk_max) {
+        abuf[0] = (uint8_t)(0x02 | (s->blk & 0x01) | 0x10);
+        memcpy(&abuf[1], &apdu[off], chunk_max);
+        crc_14a_append(abuf, chunk_max + 1);
+        write_register_single(ComIrqReg, 0x7F);
+        pcd_14a_reader_timeout_set(TCL_RESP_TIMEOUT_MS);
+        uint16_t abits = 0;
+        uint8_t ast = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, abuf, (uint8_t)(chunk_max + 3),
+                                                    rbuf, &abits, U8ARR_BIT_LEN(rbuf));
+        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+        if (ast != STATUS_HF_TAG_OK || abits < 24u) return false;
+        uint16_t arb = abits / 8u;
+        crc_14a_calculate(rbuf, arb - 2u, crc);
+        if (rbuf[arb - 2] != crc[0] || rbuf[arb - 1] != crc[1]) return false;
+        if ((rbuf[0] & 0xF6u) != 0xA2u) return false;   /* expect R(ACK) */
+        s->blk ^= 1;
+        off += chunk_max;
+    }
+
+    /* Final (or only) I-block: no chaining bit. */
+    uint16_t last = (uint16_t)(apdu_len - off);
     abuf[0] = (uint8_t)(0x02 | (s->blk & 0x01));
-    memcpy(&abuf[1], apdu, apdu_len);
-    crc_14a_append(abuf, apdu_len + 1);
-    uint8_t frame_len = (uint8_t)(apdu_len + 3);
+    memcpy(&abuf[1], &apdu[off], last);
+    crc_14a_append(abuf, last + 1);
+    uint8_t frame_len = (uint8_t)(last + 3);
 
     /* Clear stale RxIRq before transmit (bytes_transfer only clears Set1). */
     write_register_single(ComIrqReg, 0x7F);

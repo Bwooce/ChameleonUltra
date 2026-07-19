@@ -68,26 +68,76 @@ static const uint8_t m_ccid_func_desc[CCID_FUNC_DESC_LENGTH] = {
 };
 
 /* ---- endpoint I/O ---------------------------------------------------- */
-static ret_code_t ccid_rx_start(app_usbd_class_inst_t const *p_inst) {
-    app_usbd_ccid_t const *p_ccid = ccid_get(p_inst);
-    app_usbd_ccid_ctx_t   *p_ctx  = ccid_ctx_get(p_ccid);
-    p_ctx->rx_len = 0;
-    NRF_DRV_USBD_TRANSFER_OUT(xfer, p_ctx->rx_buf, sizeof(p_ctx->rx_buf));
-    return app_usbd_ep_transfer(BULK_OUT_EP(p_inst), &xfer);
+
+/* Full CCID message length (10-byte header + dwLength), or 0 if the header
+ * hasn't been received yet. */
+static uint32_t ccid_msg_total(const uint8_t *b, uint16_t len) {
+    if (len < CCID_BULK_HEADER_LEN) return 0;
+    uint32_t dlen = (uint32_t)b[CCID_OFF_LENGTH] |
+                    ((uint32_t)b[CCID_OFF_LENGTH + 1] << 8) |
+                    ((uint32_t)b[CCID_OFF_LENGTH + 2] << 16) |
+                    ((uint32_t)b[CCID_OFF_LENGTH + 3] << 24);
+    return CCID_BULK_HEADER_LEN + dlen;
 }
 
+/* Arm a bulk-OUT receive of exactly `want` bytes at the accumulation point.
+ * Sizing to the known remainder means the transfer completes on buffer-full,
+ * so messages that are an exact multiple of the 64-byte max packet (no short
+ * terminator / ZLP) still complete. `want` is clamped to the buffer. */
+static bool ccid_rx_consumer(nrf_drv_usbd_ep_transfer_t *p_next, void *p_context,
+                             size_t ep_size, size_t data_size) {
+    app_usbd_ccid_ctx_t *p_ctx = (app_usbd_ccid_ctx_t *)p_context;
+    size_t space = sizeof(p_ctx->rx_buf) - p_ctx->rx_len;
+    if (data_size > space) data_size = space;
+    /* dwLength from the bytes ALREADY stored (this packet not copied yet). */
+    uint32_t total = ccid_msg_total(p_ctx->rx_buf, p_ctx->rx_len);
+    p_next->p_data.rx = p_ctx->rx_buf + p_ctx->rx_len;
+    p_next->size      = data_size;
+    p_ctx->rx_len     = (uint16_t)(p_ctx->rx_len + data_size);
+    (void)ep_size;
+    if (total == 0) return false;   /* header not readable yet: stop, handler re-checks */
+    if (p_ctx->rx_len >= total)                 return false;  /* message complete */
+    if (p_ctx->rx_len >= sizeof(p_ctx->rx_buf)) return false;  /* buffer full      */
+    return true;   /* header known and more to come */
+}
+
+/* Arm a handled bulk-OUT transfer WITHOUT resetting rx_len (used to read the
+ * next packet(s) of a message whose header we've already seen). */
+static ret_code_t ccid_rx_arm_handled(app_usbd_class_inst_t const *p_inst) {
+    app_usbd_ccid_ctx_t *p_ctx = ccid_ctx_get(ccid_get(p_inst));
+    nrf_drv_usbd_handler_desc_t const handler_desc = {
+        .handler.consumer = ccid_rx_consumer,
+        .p_context        = p_ctx,
+    };
+    return app_usbd_ep_handled_transfer(BULK_OUT_EP(p_inst), &handler_desc);
+}
+
+static ret_code_t ccid_rx_start(app_usbd_class_inst_t const *p_inst) {
+    ccid_ctx_get(ccid_get(p_inst))->rx_len = 0;
+    return ccid_rx_arm_handled(p_inst);
+}
 static ret_code_t ccid_tx_send(app_usbd_class_inst_t const *p_inst,
                                const uint8_t *buf, size_t len) {
     NRF_DRV_USBD_TRANSFER_IN(xfer, buf, len);
     return app_usbd_ep_transfer(BULK_IN_EP(p_inst), &xfer);
 }
 
-/* Reassemble/handle one received bulk-OUT message and reply on bulk-IN. */
+/* One complete CCID message has been reassembled in rx_buf (by the consumer);
+ * process it and reply on bulk-IN (or re-arm if there is nothing to send). */
 static void ccid_on_rx_done(app_usbd_class_inst_t const *p_inst, size_t rx_size) {
-    app_usbd_ccid_t const *p_ccid = ccid_get(p_inst);
-    app_usbd_ccid_ctx_t   *p_ctx  = ccid_ctx_get(p_ccid);
+    (void)rx_size;
+    app_usbd_ccid_ctx_t *p_ctx = ccid_ctx_get(ccid_get(p_inst));
 
-    uint16_t out_len = ccid_slot_process(p_ctx->rx_buf, (uint16_t)rx_size,
+    /* The consumer stops after the first packet (before dwLength is readable) and
+     * whenever more of the message remains; continue reading the exact remainder
+     * without resetting rx_len until the full CCID message is in. */
+    uint32_t total = ccid_msg_total(p_ctx->rx_buf, p_ctx->rx_len);
+    if ((total == 0 || p_ctx->rx_len < total) && p_ctx->rx_len < sizeof(p_ctx->rx_buf)) {
+        (void)ccid_rx_arm_handled(p_inst);
+        return;
+    }
+
+    uint16_t out_len = ccid_slot_process(p_ctx->rx_buf, p_ctx->rx_len,
                                          p_ctx->tx_buf, sizeof(p_ctx->tx_buf));
     if (out_len > 0) {
         p_ctx->tx_in_flight = true;
@@ -197,9 +247,13 @@ static ret_code_t ccid_endpoint_ev(app_usbd_class_inst_t const *p_inst,
 
     if (ep == BULK_OUT_EP(p_inst)) {
         if (st == NRF_USBD_EP_OK) {
-            size_t sz = nrf_drv_usbd_epout_size_get(ep);
-            ccid_on_rx_done(p_inst, sz);
-        } else {
+            ccid_on_rx_done(p_inst, nrf_drv_usbd_epout_size_get(ep));
+        } else if (p_ctx->rx_len == 0) {
+            /* WAITING/ABORTED while idle (no message in progress): (re)arm the
+             * receive so a NAK'd first packet is picked up. Crucially, do NOT
+             * re-arm when rx_len > 0: with the app_usbd event queue enabled, a
+             * WAITING queued from the tail of the previous message can arrive
+             * part-way through the next one and would reset rx_len mid-message. */
             (void)ccid_rx_start(p_inst);
         }
         return NRF_SUCCESS;

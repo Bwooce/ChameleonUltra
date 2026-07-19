@@ -18,17 +18,22 @@
 #include <stdbool.h>
 
 #define HF14A_4_ATS_MAX     32
-#define HF14A_4_RESP_MAX    512   /* reassembled (chained) response ceiling */
+#define HF14A_4_RESP_MAX    512   /* reassembled (chained) response ceiling  */
+#define HF14A_4_CMD_MAX     261   /* command APDU ceiling (matches CCID short) */
+#define HF14A_4_FSC_DEFAULT 64    /* fallback frame size if ATS omits it      */
+#define HF14A_4_TX_FRAME_MAX 48   /* reliable RC522 TX frame cap (== our FSD); */
+                                  /* larger frames near the 64B FIFO are flaky */
 
 /** @brief One kept-alive T=CL session against a single activated card. */
 typedef struct {
-    bool    active;                    /* card activated, field kept on   */
-    uint8_t blk;                       /* current T=CL block number (0/1) */
-    uint8_t sak;                       /* card SAK                        */
-    uint8_t ats[HF14A_4_ATS_MAX];      /* ATS as returned by RATS         */
-    uint8_t ats_len;                   /* length of ats                   */
-    uint8_t uid[10];
-    uint8_t uid_len;
+    bool     active;                   /* card activated, field kept on   */
+    uint8_t  blk;                      /* current T=CL block number (0/1) */
+    uint8_t  sak;                      /* card SAK                        */
+    uint16_t fsc;                      /* card frame size (FSC, from ATS) */
+    uint8_t  ats[HF14A_4_ATS_MAX];     /* ATS as returned by RATS         */
+    uint8_t  ats_len;                  /* length of ats                   */
+    uint8_t  uid[10];
+    uint8_t  uid_len;
 } hf14a_4_session_t;
 
 /**
@@ -39,9 +44,10 @@ typedef struct {
 bool hf14a_4_session_open(hf14a_4_session_t *s);
 
 /**
- * @brief Exchange one short APDU over the open session (no re-select).
- * Handles card-side chaining and S(WTX). Command APDU must fit one frame
- * (v1: <= ~250 bytes minus PCB/CRC; outbound chaining is FU-02).
+ * @brief Exchange one APDU over the open session (no re-select).
+ * Handles reader->card chaining (command APDUs larger than the card frame
+ * size are split into chained I-blocks), card-side response chaining, and
+ * S(WTX). Command APDU capped at HF14A_4_CMD_MAX.
  * @param apdu      command APDU bytes (no PCB/CRC)
  * @param apdu_len  length of command APDU
  * @param resp      output buffer for the response APDU (no PCB/CRC)
