@@ -7184,23 +7184,22 @@ class HWSettingsCCID(DeviceRequiredUnit):
     def on_exec(self, args: argparse.Namespace):
         enabled_str = color_string((CG, "Enabled"))
         disabled_str = color_string((CR, "Disabled"))
-        is_enabled = self.cmd.get_ccid_enable()
 
-        if not args.enable and not args.disable:
-            print(f" - CCID reader: {enabled_str if is_enabled else disabled_str}")
-        elif args.enable:
-            if is_enabled:
-                print(color_string((CY, "CCID reader is already enabled.")))
-                return
+        # Always apply on -e/-d (persists the saved setting) rather than
+        # short-circuiting on the live state: a button press can runtime-disable
+        # the reader without changing the saved setting, and the user may want
+        # -e/-d to re-assert it.
+        if args.enable:
             self.cmd.set_ccid_enable(True)
-            print(f" - Successfully changed CCID reader to {enabled_str}.")
+            print(f" - CCID reader: {enabled_str}.")
             print(color_string((CY, "The device is now a PC/SC reader and will not emulate until disabled.")))
         elif args.disable:
-            if not is_enabled:
-                print(color_string((CY, "CCID reader is already disabled.")))
-                return
             self.cmd.set_ccid_enable(False)
-            print(f" - Successfully changed CCID reader to {disabled_str}.")
+            print(f" - CCID reader: {disabled_str} (returned to card emulation).")
+        else:
+            is_enabled = self.cmd.get_ccid_enable()
+            print(f" - CCID reader: {enabled_str if is_enabled else disabled_str}"
+                  + ("" if is_enabled else "  (note: a button press turns the reader off at runtime)"))
 
 
 @hw_settings.command("bleclearbonds")

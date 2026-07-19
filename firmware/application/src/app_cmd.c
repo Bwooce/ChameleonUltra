@@ -225,7 +225,9 @@ static data_frame_tx_t *cmd_processor_set_sleep_timeout(uint16_t cmd, uint16_t s
 }
 
 static data_frame_tx_t *cmd_processor_get_ccid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    uint8_t enabled = settings_get_ccid_enable() ? 1 : 0;
+    /* Report the live runtime state (a button press can runtime-disable the
+     * reader without changing the saved setting), so the CLI reflects reality. */
+    uint8_t enabled = ccid_slot_is_enabled() ? 1 : 0;
     return data_frame_make(cmd, STATUS_SUCCESS, 1, &enabled);
 }
 static data_frame_tx_t *cmd_processor_set_ccid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {

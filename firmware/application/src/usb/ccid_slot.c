@@ -46,6 +46,7 @@ void ccid_slot_set_enabled(bool en) {
     }
 }
 bool ccid_slot_card_present(void) { return m_card_present; }
+bool ccid_slot_is_enabled(void)   { return m_ccid_enabled; }
 
 bool ccid_slot_presence_changed(bool *present) {
     if (radio_is_ours()) {

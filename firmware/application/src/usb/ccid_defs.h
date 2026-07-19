@@ -134,6 +134,9 @@ void ccid_slot_set_cdc_lock(bool locked);
 /** @brief True while a card is activated in the CCID slot. */
 bool ccid_slot_card_present(void);
 
+/** @brief True if the CCID reader is currently enabled at runtime. */
+bool ccid_slot_is_enabled(void);
+
 /** @brief Periodic presence scan (main-loop context). Updates cached presence;
  *  returns true if it changed since the last host notification. @p present gets
  *  the current state. Skips scanning during an active session / CDC lock. */
