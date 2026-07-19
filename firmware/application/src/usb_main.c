@@ -228,7 +228,13 @@ void ccid_periodic_run(void) {
     last_tick = now;
 
     bool present;
-    m_ccid_field_up = true;      /* the poll below drives the antenna */
+    /* Only claim the field is up when the poll below will actually drive it.
+     * With CCID disabled (the default) ccid_slot_presence_changed() touches no
+     * RF at all and the reader may never have been initialised -- so setting
+     * this unconditionally meant the suspend path called antenna_off() on an
+     * uninitialised SPI instance, which hardfaults the device. The hazard was
+     * never the calling context, it is initialisation state. */
+    if (ccid_slot_is_enabled()) m_ccid_field_up = true;
     if (ccid_slot_presence_changed(&present)) {
         /* Only record it as notified if the notification actually went out --
          * otherwise a dropped change is never resent and the host's view of the
