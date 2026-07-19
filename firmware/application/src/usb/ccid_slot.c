@@ -227,6 +227,12 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
         }
         m_card_present = true;
         m_session_miss = 0;
+        /* Start the idle clock here, or the tick still holds a value from a
+         * previous session (or 0 at boot), session_idle_long_enough() is true on
+         * the very next poll, and R(NAK) fires at a card that has been RATS'd but
+         * has never sent an I-block -- a state where "retransmit the last
+         * I-block" is undefined and many PICCs simply mute. */
+        m_last_apdu_tick = app_timer_cnt_get();
         uint8_t atr_len = ccid_pseudo_atr_from_ats(m_session.ats, m_session.ats_len,
                                                    &resp[CCID_OFF_DATA]);
         return build_in_header(resp, RDR_TO_PC_DATABLOCK, atr_len, slot, seq,
@@ -251,13 +257,27 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         uint16_t rlen = 0;
-        m_last_apdu_tick = app_timer_cnt_get();   /* defer the R(NAK) check */
         bool ok = hf14a_4_session_apdu(&m_session, &msg[CCID_OFF_DATA], (uint16_t)dlen,
                                        &resp[CCID_OFF_DATA], &rlen,
                                        (uint16_t)(CCID_MAX_APDU_LEN));
+        /* Stamp AFTER the exchange: a chained transfer with S(WTX) extensions
+         * can run for hundreds of ms, and stamping first left the idle guard
+         * short by that duration. */
+        m_last_apdu_tick = app_timer_cnt_get();
         if (!ok) {
+            /* A failed exchange is evidence of ABSENCE, not a reason to defer
+             * the presence check. Stamping unconditionally meant a host retrying
+             * a lifted card every ~300 ms re-armed the 500 ms idle guard forever,
+             * so R(NAK) never ran and presence stayed pinned at "present". */
+            if (++m_session_miss >= CCID_PRESENCE_MISS_LIMIT) {
+                hf14a_4_session_close(&m_session);
+                hf14a_4_presence_reset();
+                m_card_present = false;
+                m_session_miss = 0;
+            }
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
+        m_session_miss = 0;
         return build_in_header(resp, RDR_TO_PC_DATABLOCK, rlen, slot, seq,
                                CCID_CMD_STATUS_OK, CCID_ERROR_NONE, 0);
     }
