@@ -54,6 +54,12 @@ static bool session_idle_long_enough(void) {
  * never announced. */
 static bool m_card_present = false;
 static enum { NOTIFY_UNKNOWN, NOTIFY_ABSENT, NOTIFY_PRESENT } m_notified = NOTIFY_UNKNOWN;
+/* True once a poll has actually driven the antenna, which is the only safe
+ * signal that the reader is initialised. Owned here because this module is the
+ * one that drives RF -- keeping it in usb_main let the flag and reality diverge,
+ * which is how the suspend path came to call antenna_off() on an uninitialised
+ * SPI instance and hardfault the device. */
+static bool m_field_up = false;
 
 static inline bool radio_is_ours(void) {
     return m_ccid_enabled && (m_radio_holders == 0);
@@ -88,8 +94,10 @@ static void presence_lost(void) {
 }
 
 void ccid_slot_radio_shutdown(void) {
+    if (!m_field_up) return;            /* nothing was ever driven: nothing to undo */
     presence_lost();
     hf14a_4_field_off();                /* power decision: suspend / cable pull */
+    m_field_up = false;
     /* The host's view is now stale or about to be reset, so record that we do
      * not know what it thinks rather than asserting a value that could collide
      * with the next scan result. */
@@ -101,6 +109,7 @@ bool ccid_slot_is_enabled(void)   { return m_ccid_enabled; }
 
 bool ccid_slot_presence_changed(bool *present) {
     if (radio_is_ours()) {
+        m_field_up = true;              /* the polls below drive the antenna */
         if (!m_session.active) {
             /* Idle: the reader reports what it saw, the hysteresis policy lives
              * here. UNSURE holds the previous state without touching the counter

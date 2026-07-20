@@ -42,7 +42,6 @@ APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
 // Endpoints from the free pool (CDC uses EPIN1/EPIN2/EPOUT1): bulk-IN EPIN3,
 // bulk-OUT EPOUT2, intr-IN EPIN4.
 #if defined(PROJECT_CHAMELEON_ULTRA)
-#include "rfid/reader/hf/rc522.h"      /* antenna control on USB suspend */
 #define CCID_INTERFACE          2
 APP_USBD_CCID_GLOBAL_DEF(m_app_ccid,
                          CCID_INTERFACE,
@@ -53,9 +52,6 @@ APP_USBD_CCID_GLOBAL_DEF(m_app_ccid,
 /* Set from the USB event handler, read by ccid_periodic_run(): the SDK leaves
  * app_usbd_core_state_get() == Configured across a suspend, so we track it. */
 static volatile bool m_usb_suspended = false;
-/* True once a presence poll has driven the antenna, so we know the reader is
- * initialised and it is safe to switch the field off on suspend. */
-static bool m_ccid_field_up = false;
 #endif
 
 // USB DEFINES END
@@ -219,12 +215,9 @@ void ccid_periodic_run(void) {
     bool may_scan = !m_usb_suspended && g_usb_connected &&
                     (app_usbd_core_state_get() == APP_USBD_STATE_Configured);
     if (!may_scan) {
-        /* Safe here (main loop) and only when a poll actually drove the
-         * antenna, so the reader is known to be initialised. */
-        if (m_ccid_field_up) {
-            ccid_slot_radio_shutdown();   /* closes the session AND drops the field */
-            m_ccid_field_up = false;
-        }
+        /* Idempotent, and a no-op if no poll ever drove the antenna -- the slot
+         * owns that state, because it owns the RF. */
+        ccid_slot_radio_shutdown();
         return;
     }
     static uint32_t last_tick = 0;
@@ -233,13 +226,6 @@ void ccid_periodic_run(void) {
     last_tick = now;
 
     bool present;
-    /* Only claim the field is up when the poll below will actually drive it.
-     * With CCID disabled (the default) ccid_slot_presence_changed() touches no
-     * RF at all and the reader may never have been initialised -- so setting
-     * this unconditionally meant the suspend path called antenna_off() on an
-     * uninitialised SPI instance, which hardfaults the device. The hazard was
-     * never the calling context, it is initialisation state. */
-    if (ccid_slot_is_enabled()) m_ccid_field_up = true;
     if (ccid_slot_presence_changed(&present)) {
         /* Only record it as notified if the notification actually went out --
          * otherwise a dropped change is never resent and the host's view of the
