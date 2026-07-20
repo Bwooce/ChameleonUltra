@@ -82,6 +82,13 @@ static data_frame_tx_t *cmd_processor_change_device_mode(uint16_t cmd, uint16_t 
 #endif
     } else {
 #if defined(PROJECT_CHAMELEON_ULTRA)
+        /* Disable CCID FIRST. Otherwise the next presence poll (150 ms) calls
+         * reader_mode_enter() and drags the device straight back, so the
+         * requested tag mode never sticks: emulation is silently non-functional
+         * and each poll costs a mode thrash including tag_mode_enter()'s 60 ms
+         * delay. The button pre-empt and the CCID-disable command both already
+         * do this; this path did not. */
+        ccid_slot_set_enabled(false);
         tag_mode_enter();
 #endif
         return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
