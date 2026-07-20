@@ -21,6 +21,7 @@
 #define HF14A_4_CMD_MAX     261   /* command APDU ceiling (matches CCID short) */
 #define HF14A_4_FSC_DEFAULT 64    /* fallback frame size if ATS omits it      */
 #define HF14A_4_PROBE_TIMEOUT_MS 10 /* idle presence probe: ATQA answers in ~1ms */
+#define HF14A_4_WTX_TIMEOUT_MAX_MS 3000 /* ceiling on an S(WTX) extension        */
 #define HF14A_4_FIELD_SETTLE_MS  5  /* ISO14443-3 5.1 minimum after field on     */
 #define HF14A_4_SCAN_ATTEMPTS    2  /* tier-2 selects per poll (card settling)   */
 #define HF14A_4_SCAN_RETRY_MS    8  /* settle before the retry                   */

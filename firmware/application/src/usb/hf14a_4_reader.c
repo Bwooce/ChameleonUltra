@@ -160,8 +160,21 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                 wtx[0] = resp_pcb;
                 wtx[1] = rbuf[1];
                 crc_14a_append(wtx, 2);
+                /* Honour the requested extension. S(WTX) carries WTXM in the low
+                 * 6 bits, and per ISO14443-4 the PICC may then take up to
+                 * WTXM x FWT to answer. Echoing the request but then waiting the
+                 * unextended time defeats the point: a card doing genuine work
+                 * (a JavaCard generating an RSA key, say) legitimately asks for
+                 * far longer than the default and would simply be cut off.
+                 * Clamped so a bogus or hostile WTXM cannot stall the main loop
+                 * indefinitely -- this runs in main-loop context, and blocking
+                 * here starves the USB event queue. */
+                uint8_t wtxm = rbuf[1] & 0x3Fu;
+                if (wtxm == 0) wtxm = 1;                    /* 0 is not valid  */
+                uint32_t wtx_to = (uint32_t)TCL_RESP_TIMEOUT_MS * wtxm;
+                if (wtx_to > HF14A_4_WTX_TIMEOUT_MAX_MS) wtx_to = HF14A_4_WTX_TIMEOUT_MAX_MS;
                 write_register_single(ComIrqReg, 0x7F);
-                pcd_14a_reader_timeout_set(TCL_RESP_TIMEOUT_MS);
+                pcd_14a_reader_timeout_set((uint16_t)wtx_to);
                 rbits = 0;
                 st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, wtx, 4,
                                                    rbuf, &rbits, U8ARR_BIT_LEN(rbuf));
