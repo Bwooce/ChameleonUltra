@@ -47,11 +47,15 @@ static const uint8_t m_ccid_func_desc[CCID_FUNC_DESC_LENGTH] = {
     CCID_DESC_TYPE_FUNCTIONAL,      /* bDescriptorType = 0x21                */
     0x10, 0x01,                     /* bcdCCID = 1.10                        */
     0x00,                           /* bMaxSlotIndex = 0 (1 slot)            */
-    0x00,                           /* bVoltageSupport (contactless: n/a).    */
-                                    /* NOTE: 0x01 (5V) was tried for strict   */
-                                    /* libccid/usbccid.sys, but is under       */
-                                    /* investigation for a macOS enumeration   */
-                                    /* regression -- keep the known-good 0x00. */
+    0x01,                           /* bVoltageSupport = 5V.                  */
+                                    /* Contactless has no Vcc, so the field is */
+                                    /* nominally meaningless -- but strict     */
+                                    /* libccid (Linux) and usbccid.sys         */
+                                    /* (Windows) sanity-check it, and 0x00     */
+                                    /* ("supports no voltage") is what they    */
+                                    /* reject. macOS accepts either, which is  */
+                                    /* exactly why the problem cannot be found */
+                                    /* here. 5V is the safe declaration.       */
     0x02, 0x00, 0x00, 0x00,         /* dwProtocols = T=1                     */
     0xFC, 0x0D, 0x00, 0x00,         /* dwDefaultClock = 3580 kHz             */
     0xFC, 0x0D, 0x00, 0x00,         /* dwMaximumClock = 3580 kHz             */
