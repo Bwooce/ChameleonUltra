@@ -118,6 +118,28 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
              * init check -- touching the radio here hardfaults the device. The
              * field is dropped from the main loop instead, see ccid_periodic_run. */
             m_usb_suspended = true;
+            /* Drop the field here rather than on the next ccid_periodic_run():
+             * this event is dispatched from app_usbd_event_queue_process(),
+             * which the main loop calls AFTER ccid_periodic_run() and just
+             * before sleep_system_run(), so the device can enter its sleep path
+             * before the gate gets another iteration.
+             *
+             * Safe despite the rc522 init hazard that has bitten this code
+             * repeatedly: the USB event queue is drained from the main loop, not
+             * an ISR, and this is a no-op unless a poll actually drove the
+             * antenna, with hf14a_4_field_off() additionally guarded on
+             * get_device_mode().
+             *
+             * HONEST STATUS: on macOS this is belt-and-braces, not the thing
+             * that actually saves the battery. Measured across a host sleep, the
+             * field LED goes out only AFTER the power-off animation -- i.e. it
+             * is system_off_enter() pulling READER_POWER low that kills the
+             * carrier, not this call. Why this path does not visibly drop it
+             * first was not chased, since the field does end up off either way.
+             * Retained because a host that suspends the bus WITHOUT the device
+             * deep-sleeping would otherwise leave the carrier driven, and that
+             * case is untested (Linux/Windows). */
+            ccid_slot_radio_shutdown();
 #endif
             break;
 
