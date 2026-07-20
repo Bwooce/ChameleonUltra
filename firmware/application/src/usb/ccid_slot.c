@@ -41,6 +41,19 @@ static uint32_t m_last_apdu_tick = 0;
 #define CCID_MISS_LIMIT  2
 static uint8_t m_miss = 0;
 
+/* A card can classify as ISO14443-4 from the tier-2 scan yet still fail
+ * IccPowerOn -- marginal coupling, or RATS failing at the edge of the field.
+ * The scan SUCCEEDS, so the reader's own scan back-off never engages, and the
+ * result is announce -> host powers on -> fails -> retract -> re-announce, at
+ * the poll rate, indefinitely: an interrupt-IN transfer and a full
+ * anticollision+RATS every 150 ms. Count consecutive activation failures and
+ * then stay quiet for a while, so a card the host cannot use costs one attempt
+ * every few seconds rather than seven a second. */
+#define CCID_POWERON_FAIL_LIMIT  3   /* consecutive IccPowerOn failures      */
+#define CCID_ANNOUNCE_SKIP      20   /* polls to stay quiet (~3 s at 150 ms) */
+static uint8_t m_poweron_fails = 0;
+static uint8_t m_announce_skip = 0;
+
 static bool session_idle_long_enough(void) {
     uint32_t now = app_timer_cnt_get();
     return app_timer_cnt_diff_compute(now, m_last_apdu_tick) >= APP_TIMER_TICKS(CCID_SESSION_IDLE_MS);
@@ -97,6 +110,9 @@ static void presence_lost(void) {
     hf14a_4_presence_reset();
     m_card_present = false;
     m_miss = 0;
+    /* The card is gone, so a fresh one deserves a fresh chance to activate. */
+    m_poweron_fails = 0;
+    m_announce_skip = 0;
 }
 
 void ccid_slot_radio_shutdown(void) {
@@ -123,7 +139,14 @@ bool ccid_slot_presence_changed(bool *present) {
              * a card still settling must not read as a removal. */
             switch (hf14a_4_presence()) {
                 case HF14A_PRES_ISO4:
-                    m_card_present = true;  m_miss = 0; break;
+                    m_miss = 0;
+                    if (m_announce_skip) {      /* activation keeps failing */
+                        m_announce_skip--;
+                        m_card_present = false;
+                        break;
+                    }
+                    m_card_present = true;
+                    break;
                 case HF14A_PRES_OTHER:      /* a card, but not one CCID can use */
                     m_card_present = false; m_miss = 0; break;
                 case HF14A_PRES_UNSURE:
@@ -296,10 +319,16 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
              * poll rather than re-announcing the same card from a stale cache
              * (which would flap present/absent every poll). */
             hf14a_4_presence_reset();
+            if (++m_poweron_fails >= CCID_POWERON_FAIL_LIMIT) {
+                m_announce_skip = CCID_ANNOUNCE_SKIP;
+                m_poweron_fails = 0;
+            }
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         m_card_present = true;
         m_miss = 0;
+        m_poweron_fails = 0;
+        m_announce_skip = 0;
         /* session_open() energised the antenna, so record that the field is up.
          * Previously only the presence poll set this, leaving a window where a
          * session was opened with m_field_up false -- and then
