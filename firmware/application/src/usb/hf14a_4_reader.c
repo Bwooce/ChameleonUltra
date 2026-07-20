@@ -97,11 +97,15 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         uint8_t ast = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, abuf, (uint8_t)(chunk_max + 3),
                                                     rbuf, &abits, U8ARR_BIT_LEN(rbuf));
         pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-        if (ast != STATUS_HF_TAG_OK || abits < 24u) return false;
+        /* Any failure here leaves the card mid-chain, expecting further chained
+         * I-blocks -- the next APDU would be a protocol violation with undefined
+         * recovery. Drop the session so the slot answers ICC_MUTE and the host
+         * re-powers, matching what the overflow paths below do. */
+        if (ast != STATUS_HF_TAG_OK || abits < 24u) { hf14a_4_session_close(s); return false; }
         uint16_t arb = abits / 8u;
         crc_14a_calculate(rbuf, arb - 2u, crc);
-        if (rbuf[arb - 2] != crc[0] || rbuf[arb - 1] != crc[1]) return false;
-        if ((rbuf[0] & 0xF6u) != 0xA2u) return false;   /* expect R(ACK) */
+        if (rbuf[arb - 2] != crc[0] || rbuf[arb - 1] != crc[1]) { hf14a_4_session_close(s); return false; }
+        if ((rbuf[0] & 0xF6u) != 0xA2u) { hf14a_4_session_close(s); return false; }   /* expect R(ACK) */
         s->blk ^= 1;
         off += chunk_max;
     }
@@ -422,8 +426,11 @@ void hf14a_4_field_off(void) {
      * pcd_14a_reader_reset(), which does guard) -- so calling it outside reader
      * mode is a raw SPI write on a handle that tag_mode_enter() has already
      * torn down via pcd_14a_reader_uninit(), and it hardfaults the device.
-     * Nothing is lost by skipping: tag_mode_enter() switches the field off
-     * itself before uninitialising the reader. */
+     * Skipping is safe, though NOT for the reason one might assume:
+     * tag_mode_enter()'s own antenna_off() is guarded on m_is_field_on, which is
+     * the BUTTON field-generator flag, not g_is_reader_antenna_on -- so when
+     * CCID drove the antenna it is skipped there too. What actually kills the
+     * carrier is nrf_gpio_pin_clear(READER_POWER) in that same function. */
     if (get_device_mode() != DEVICE_MODE_READER) return;
     pcd_14a_reader_antenna_off();
 }

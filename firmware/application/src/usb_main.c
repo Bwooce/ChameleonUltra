@@ -152,6 +152,9 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
 
         case APP_USBD_EVT_STARTED:
             NRF_LOG_INFO("USB STARTED");
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            m_usb_suspended = false;
+#endif
             break;
 
         case APP_USBD_EVT_STOPPED:
@@ -160,6 +163,17 @@ static void usbd_user_ev_handler(app_usbd_event_type_t event) {
             break;
 
         case APP_USBD_EVT_POWER_DETECTED:
+#if defined(PROJECT_CHAMELEON_ULTRA)
+            /* Clear the suspend latch on ANY evidence the bus is back, not just
+             * DRV_RESUME. A host sleep that drops VBUS goes SUSPEND ->
+             * POWER_REMOVED -> app_usbd_stop() -> STOPPED -> disable, and on
+             * wake POWER_DETECTED -> POWER_READY -> DRV_RESET -> Configured --
+             * with no DRV_RESUME anywhere. Clearing only on RESUME therefore
+             * latched may_scan false forever and CCID silently never saw another
+             * card until a reboot. Missed in testing because the device usually
+             * deep-slept and rebooted in between, which cleared it. */
+            m_usb_suspended = false;
+#endif
             sleep_timer_stop();
             NRF_LOG_INFO("USB power detected");
             if (!nrf_drv_usbd_is_enabled()) {

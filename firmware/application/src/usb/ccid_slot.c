@@ -61,6 +61,8 @@ static enum { NOTIFY_UNKNOWN, NOTIFY_ABSENT, NOTIFY_PRESENT } m_notified = NOTIF
  * SPI instance and hardfault the device. */
 static bool m_field_up = false;
 
+static void presence_lost(void);   /* forward: used by the enable/hold paths */
+
 static inline bool radio_is_ours(void) {
     return m_ccid_enabled && (m_radio_holders == 0);
 }
@@ -68,6 +70,11 @@ static inline bool radio_is_ours(void) {
 void ccid_slot_radio_hold(uint8_t who, bool held) {
     if (held) m_radio_holders |= who;
     else      m_radio_holders &= (uint8_t)~who;
+    /* A partial miss count must not survive a handover: otherwise one failed
+     * XfrBlock before the hold plus one transient GONE after it jointly declare
+     * a removal, from two unrelated events separated by another subsystem
+     * owning the radio. */
+    m_miss = 0;
     /* Whoever had the radio may have left a different card in the field (and
      * the CDC hooks switch the antenna off), so the cached classification is no
      * longer trustworthy either way. */
@@ -80,9 +87,8 @@ void ccid_slot_set_enabled(bool en) {
     m_ccid_enabled = en;
     hf14a_4_presence_reset();           /* cards may swap while we are not looking */
     if (!en) {                          /* disable: drop the card (main-loop ctx) */
-        hf14a_4_session_close(&m_session);
+        presence_lost();                /* one teardown, so m_miss resets too    */
         hf14a_4_field_off();            /* power decision: stop driving the field */
-        m_card_present = false;
     }
 }
 /* One teardown, so every caller agrees what "the card went away" means. */
@@ -294,6 +300,12 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
         }
         m_card_present = true;
         m_miss = 0;
+        /* session_open() energised the antenna, so record that the field is up.
+         * Previously only the presence poll set this, leaving a window where a
+         * session was opened with m_field_up false -- and then
+         * ccid_slot_radio_shutdown() was a permanent no-op and the carrier
+         * stayed driven, which is the exact failure that call exists to stop. */
+        m_field_up = true;
         /* Start the idle clock here, or the tick still holds a value from a
          * previous session (or 0 at boot), session_idle_long_enough() is true on
          * the very next poll, and R(NAK) fires at a card that has been RATS'd but
