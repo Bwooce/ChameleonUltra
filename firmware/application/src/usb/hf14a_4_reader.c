@@ -309,11 +309,25 @@ hf14a_pres_t hf14a_4_presence(void) {
     if (s_backoff) { s_backoff--; return HF14A_PRES_UNSURE; }
 
     /* Tier 2: newly arrived -- pay for the full scan, since confirming an
-     * ISO14443-4 card needs the SAK (anticollision + SELECT). */
-    pcd_14a_reader_timeout_set(100);
+     * ISO14443-4 card needs the SAK (anticollision + SELECT).
+     *
+     * Retry once in-cycle rather than surrendering the rest of the poll. A card
+     * being placed by hand is still settling when WUPA first answers, so the
+     * first select routinely fails; waiting for the next 300 ms poll then costs
+     * a full cycle. Measured against a prompted 4 s hold, arrival ran ~1185 ms
+     * versus ~1068 ms for departure -- backwards, since arrival should be one
+     * poll (~275 ms) and departure two misses (~450-600 ms). That ~300 ms
+     * excess is exactly one poll, i.e. one wasted scan. A short settle plus one
+     * retry recovers it, and costs nothing when the first scan succeeds. */
     picc_14a_tag_t tag;
-    uint8_t status = pcd_14a_reader_scan_auto(&tag);
-    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    uint8_t status;
+    for (uint8_t attempt = 0; attempt < HF14A_4_SCAN_ATTEMPTS; attempt++) {
+        if (attempt) bsp_delay_ms(HF14A_4_SCAN_RETRY_MS);
+        pcd_14a_reader_timeout_set(100);
+        status = pcd_14a_reader_scan_auto(&tag);
+        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+        if (status == STATUS_HF_TAG_OK) break;
+    }
 
     /* Leave the card HALTed. scan_auto leaves it SELECTED/ACTIVE, and an ACTIVE
      * card ignores WUPA -- so the next probe would report it gone and presence

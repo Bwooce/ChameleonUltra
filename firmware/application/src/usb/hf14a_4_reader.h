@@ -22,6 +22,8 @@
 #define HF14A_4_FSC_DEFAULT 64    /* fallback frame size if ATS omits it      */
 #define HF14A_4_PROBE_TIMEOUT_MS 10 /* idle presence probe: ATQA answers in ~1ms */
 #define HF14A_4_FIELD_SETTLE_MS  5  /* ISO14443-3 5.1 minimum after field on     */
+#define HF14A_4_SCAN_ATTEMPTS    2  /* tier-2 selects per poll (card settling)   */
+#define HF14A_4_SCAN_RETRY_MS    8  /* settle before the retry                   */
 #define HF14A_4_PRESENCE_TIMEOUT_MS 30 /* R(NAK) presence check; card answers in ~1ms */
 #define HF14A_4_TX_FRAME_MAX 48   /* reliable RC522 TX frame cap (== our FSD); */
                                   /* larger frames near the 64B FIFO are flaky */
