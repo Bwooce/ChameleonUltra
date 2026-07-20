@@ -195,6 +195,8 @@ void usb_cdc_init(void) {
 #endif
 }
 
+#define CCID_POLL_INTERVAL_MS  150
+
 // Interrupt-driven CCID presence: scan the field on an interval (main-loop
 // context, so the blocking RF scan is safe) and push RDR_to_PC_NotifySlotChange
 // only when presence changes. Called from the main loop.
@@ -222,7 +224,13 @@ void ccid_periodic_run(void) {
     }
     static uint32_t last_tick = 0;
     uint32_t now = app_timer_cnt_get();
-    if (app_timer_cnt_diff_compute(now, last_tick) < APP_TIMER_TICKS(300)) return;
+    /* 150 ms, not 300. This interval is the dominant term in BOTH detection
+     * latencies: arrival waits on average half of it, and removal needs two
+     * consecutive misses so it costs two full intervals. An idle poll is now
+     * only the WUPA probe (~18 ms), so the duty cycle is ~12% -- nowhere near
+     * the ~68% that caused the original main-loop starvation, when a single
+     * poll ran ~2 s. */
+    if (app_timer_cnt_diff_compute(now, last_tick) < APP_TIMER_TICKS(CCID_POLL_INTERVAL_MS)) return;
     last_tick = now;
 
     bool present;
