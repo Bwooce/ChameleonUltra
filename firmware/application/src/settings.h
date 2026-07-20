@@ -5,7 +5,7 @@
 
 #include "utils.h"
 
-#define SETTINGS_CURRENT_VERSION 6
+#define SETTINGS_CURRENT_VERSION 7
 #define SETTINGS_SLEEP_TIMEOUT_DEFAULT_S 8   // default wake timeout in seconds (matches SLEEP_DELAY_MS_BUTTON_WAKEUP)
 #define SETTINGS_SLEEP_TIMEOUT_MIN_S      5
 #define SETTINGS_SLEEP_TIMEOUT_MAX_S      60
@@ -41,7 +41,8 @@ typedef struct ALIGN_U32 {
     // 1 byte
     uint8_t animation_config : 2;
     uint8_t ble_pairing_enable : 1;
-    uint8_t reserved0 : 5; // If you are add switch field, reallocating me.
+    uint8_t ccid_enable : 1;    // add on version7: expose USB CCID reader (Ultra)
+    uint8_t reserved0 : 4; // If you are add switch field, reallocating me.
 
     // 1 byte
     uint8_t button_a_press : 4;
@@ -84,4 +85,7 @@ bool settings_get_ble_pairing_enable_first_load(void);
 uint32_t settings_get_sleep_timeout(void);
 void settings_set_sleep_timeout(uint8_t seconds);
 void settings_init_sleep_timeout_config(void);
+bool settings_get_ccid_enable(void);
+void settings_set_ccid_enable(bool enable);
+void settings_init_ccid_enable_config(void);
 #endif

@@ -7167,6 +7167,41 @@ class HWSettingsSleepTimeout(DeviceRequiredUnit):
             print(f"Current wake timeout: {current} seconds")
 
 
+@hw_settings.command("ccid")
+class HWSettingsCCID(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Show or configure the USB CCID (PC/SC smart-card reader) interface (Ultra only)"
+        set_group = parser.add_mutually_exclusive_group()
+        set_group.add_argument(
+            "-e", "--enable", action="store_true", help="Enable the CCID reader (device becomes a PC/SC reader)"
+        )
+        set_group.add_argument(
+            "-d", "--disable", action="store_true", help="Disable the CCID reader (return to card emulation)"
+        )
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        enabled_str = color_string((CG, "Enabled"))
+        disabled_str = color_string((CR, "Disabled"))
+
+        # Always apply on -e/-d (persists the saved setting) rather than
+        # short-circuiting on the live state: a button press can runtime-disable
+        # the reader without changing the saved setting, and the user may want
+        # -e/-d to re-assert it.
+        if args.enable:
+            self.cmd.set_ccid_enable(True)
+            print(f" - CCID reader: {enabled_str}.")
+            print(color_string((CY, "The device is now a PC/SC reader and will not emulate until disabled.")))
+        elif args.disable:
+            self.cmd.set_ccid_enable(False)
+            print(f" - CCID reader: {disabled_str} (returned to card emulation).")
+        else:
+            is_enabled = self.cmd.get_ccid_enable()
+            print(f" - CCID reader: {enabled_str if is_enabled else disabled_str}"
+                  + ("" if is_enabled else "  (note: a button press turns the reader off at runtime)"))
+
+
 @hw_settings.command("bleclearbonds")
 class HWSettingsBleClearBonds(DeviceRequiredUnit):
 

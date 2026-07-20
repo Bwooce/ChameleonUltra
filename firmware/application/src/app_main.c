@@ -38,6 +38,7 @@ NRF_LOG_MODULE_REGISTER();
 #include "syssleep.h"
 #include "tag_emulation.h"
 #include "usb_main.h"
+#include "usb/ccid_defs.h"
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 #include "settings.h"
@@ -920,6 +921,17 @@ extern bool g_usb_led_marquee_enable;
 static void button_press_process(void) {
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
+#if defined(PROJECT_CHAMELEON_ULTRA)
+        // Physical interaction decisively pre-empts the CCID reader: turn it off
+        // and return to card emulation so the button action runs cleanly (the
+        // CCID presence scanner otherwise fights it for reader mode). Runtime
+        // only -- the saved setting is untouched, so CCID re-enables on reboot
+        // or via `hw settings ccid -e`.
+        if (ccid_slot_is_enabled()) {
+            ccid_slot_set_enabled(false);
+            tag_mode_enter();
+        }
+#endif
         if (m_is_a_btn_release) {
             if (!m_is_btn_long_press) {
                 run_button_function_by_settings(settings_get_button_press_config('a'));
@@ -1053,6 +1065,8 @@ int main(void) {
 
         // Data pack process
         data_frame_process();
+        // CCID interrupt-driven presence scan (no-op unless CCID enabled)
+        ccid_periodic_run();
         // Log print process
         while (NRF_LOG_PROCESS());
         // USB event process

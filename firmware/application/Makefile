@@ -1,5 +1,18 @@
 include ../Makefile.defs
 
+# OUTPUT_DIRECTORY is shared by both device types, and nothing in the object
+# rules depends on CURRENT_DEVICE_TYPE. A back-to-back ultra -> lite build would
+# therefore relink lite against stale ultra objects, silently producing a "lite"
+# image that still contains the Ultra-only code. Stamp the type and drop just
+# this target's objects when it changes (NOT the whole directory: build.sh
+# builds the bootloader into OUTPUT_DIRECTORY before the application).
+DEVICE_TYPE_STAMP := $(OUTPUT_DIRECTORY)/.device_type
+$(shell mkdir -p $(OUTPUT_DIRECTORY); \
+        if [ "$$(cat $(DEVICE_TYPE_STAMP) 2>/dev/null)" != "$(CURRENT_DEVICE_TYPE)" ]; then \
+            rm -rf $(OUTPUT_DIRECTORY)/application; \
+            echo "$(CURRENT_DEVICE_TYPE)" > $(DEVICE_TYPE_STAMP); \
+        fi)
+
 TARGETS          := application
 $(OUTPUT_DIRECTORY)/application.out: \
   LINKER_SCRIPT  := application.ld
@@ -185,6 +198,7 @@ INC_FOLDERS += \
   ${SRC_COMMON} \
   ${PROJ_DIR}/bsp/ \
   ${PROJ_DIR}/utils/ \
+  ${PROJ_DIR}/usb/ \
   ${PROJ_DIR}/rfid/ \
   ${PROJ_DIR}/rfid/nfctag/ \
   ${PROJ_DIR}/rfid/nfctag/hf \
@@ -358,6 +372,9 @@ ifeq	(${CURRENT_DEVICE_TYPE}, ${CHAMELEON_ULTRA})
     $(PROJ_DIR)/rfid/reader/lf/lf_ioprox_data.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_viking_data.c \
     $(PROJ_DIR)/rfid/reader/lf/lf_jablotron_data.c \
+    $(PROJ_DIR)/usb/app_usbd_ccid.c \
+    $(PROJ_DIR)/usb/ccid_slot.c \
+    $(PROJ_DIR)/usb/hf14a_4_reader.c \
 
   INC_FOLDERS +=\
     ${PROJ_DIR}/rfid/reader/ \

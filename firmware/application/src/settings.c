@@ -58,6 +58,11 @@ void settings_init_sleep_timeout_config(void) {
     config.sleep_timeout = SETTINGS_SLEEP_TIMEOUT_DEFAULT_S;
 }
 
+// add on version7
+void settings_init_ccid_enable_config(void) {
+    config.ccid_enable = false;  // USB CCID reader off by default (normal Chameleon)
+}
+
 void settings_init_config(void) {
     settings_update_version_for_config();
     config.animation_config = SettingsAnimationModeFull; // add on version1
@@ -66,6 +71,7 @@ void settings_init_config(void) {
     settings_init_ble_connect_key_config();
     settings_init_ble_pairing_enable_config();
     settings_init_sleep_timeout_config();
+    settings_init_ccid_enable_config();
 }
 
 void settings_migrate(void) {
@@ -88,6 +94,9 @@ void settings_migrate(void) {
 
         case 5:
             settings_init_sleep_timeout_config();
+
+        case 6:
+            settings_init_ccid_enable_config();
 
             /*
              * Add new migration steps ABOVE THIS COMMENT
@@ -307,4 +316,12 @@ uint32_t settings_get_sleep_timeout(void) {
 
 void settings_set_sleep_timeout(uint8_t seconds) {
     config.sleep_timeout = seconds;
+}
+
+bool settings_get_ccid_enable(void) {
+    return config.ccid_enable;
+}
+
+void settings_set_ccid_enable(bool enable) {
+    config.ccid_enable = enable ? 1 : 0;
 }

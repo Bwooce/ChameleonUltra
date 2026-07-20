@@ -12,6 +12,7 @@
 #include "tag_persistence.h"
 #include "nrf_pwr_mgmt.h"
 #include "settings.h"
+#include "ccid_defs.h"
 #include "delayed_reset.h"
 #include "netdata.h"
 #if defined(PROJECT_CHAMELEON_ULTRA)
@@ -222,6 +223,34 @@ static data_frame_tx_t *cmd_processor_set_sleep_timeout(uint16_t cmd, uint16_t s
     settings_set_sleep_timeout(data[0]);
     return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
 }
+
+#if defined(PROJECT_CHAMELEON_ULTRA)
+static data_frame_tx_t *cmd_processor_get_ccid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    /* Report the live runtime state (a button press can runtime-disable the
+     * reader without changing the saved setting), so the CLI reflects reality. */
+    uint8_t enabled = ccid_slot_is_enabled() ? 1 : 0;
+    return data_frame_make(cmd, STATUS_SUCCESS, 1, &enabled);
+}
+static data_frame_tx_t *cmd_processor_set_ccid_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 1 || data[0] > 1) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    bool enable = (data[0] != 0);
+    if (settings_get_ccid_enable() != enable) {
+        settings_set_ccid_enable(enable);
+        settings_save_config();        // (settings_save_config already CRC-gates the
+                                       //  write; the guard is so a button-disabled
+                                       //  runtime state can be re-enabled without churn)
+    }
+    ccid_slot_set_enabled(enable);     // always apply the runtime state
+    if (!enable) {
+        // CCID off => normal Chameleon: return to card emulation. (When enabled,
+        // the CCID presence scanner switches to reader mode on its own.)
+        tag_mode_enter();
+    }
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+#endif // PROJECT_CHAMELEON_ULTRA
 
 static data_frame_tx_t *cmd_processor_get_ble_pairing_enable(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t is_enable = settings_get_ble_pairing_enable();
@@ -1835,6 +1864,9 @@ static data_frame_tx_t *before_reader_run(uint16_t cmd, uint16_t status, uint16_
 static data_frame_tx_t *before_hf_reader_run(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     data_frame_tx_t *ret = before_reader_run(cmd, status, length, data);
     if (ret == NULL) {
+        // Q5: CDC pre-empts CCID. Lock the radio for this reader/attack command so
+        // the CCID slot reports the card removed and stops relaying until we finish.
+        ccid_slot_set_cdc_lock(true);
         pcd_14a_reader_reset();
         pcd_14a_reader_antenna_on();
         bsp_delay_ms(8);
@@ -1847,6 +1879,7 @@ static data_frame_tx_t *before_hf_reader_run(uint16_t cmd, uint16_t status, uint
  */
 static data_frame_tx_t *after_hf_reader_run(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     pcd_14a_reader_antenna_off();
+    ccid_slot_set_cdc_lock(false);   // release the radio back to the CCID slot
     return NULL;
 }
 
@@ -3010,6 +3043,10 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_SET_BLE_PAIRING_ENABLE,       NULL,                        cmd_processor_set_ble_pairing_enable,        NULL                   },
     {    DATA_CMD_GET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_get_sleep_timeout,             NULL                   },
     {    DATA_CMD_SET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_set_sleep_timeout,             NULL                   },
+#if defined(PROJECT_CHAMELEON_ULTRA)
+    {    DATA_CMD_GET_CCID_ENABLE,              NULL,                        cmd_processor_get_ccid_enable,               NULL                   },
+    {    DATA_CMD_SET_CCID_ENABLE,              NULL,                        cmd_processor_set_ccid_enable,               NULL                   },
+#endif
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
