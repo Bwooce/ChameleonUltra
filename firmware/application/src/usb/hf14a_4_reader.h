@@ -64,6 +64,21 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
 /** @brief Deactivate: drop the RF field and mark the session inactive. */
 void hf14a_4_session_close(hf14a_4_session_t *s);
 
+/** @brief Result of a presence poll.
+ *
+ * The reader reports what it SAW; it deliberately owns no hysteresis. How many
+ * misses constitute a removal is a policy question and belongs in exactly one
+ * place (ccid_slot.c), rather than being duplicated between the idle probe and
+ * the in-session R(NAK) check -- the seam between those two counters is where
+ * every presence bug in this work clustered.
+ */
+typedef enum {
+    HF14A_PRES_GONE,    /* nothing answered -- caller applies hysteresis */
+    HF14A_PRES_ISO4,    /* ISO14443-4 card, usable by CCID               */
+    HF14A_PRES_OTHER,   /* a card, but not ISO14443-4 (e.g. MIFARE)      */
+    HF14A_PRES_UNSURE,  /* something is there but would not select yet   */
+} hf14a_pres_t;
+
 /**
  * @brief Lightweight presence probe for GetSlotStatus polling.
  *
@@ -72,9 +87,9 @@ void hf14a_4_session_close(hf14a_4_session_t *s);
  * Leaves the field ON. Must NOT be called while a full session is active
  * (it would re-select and disrupt an in-progress T=CL exchange).
  *
- * @return true if a 14443-4 card is present.
+ * @return what was seen; the caller applies removal hysteresis.
  */
-bool hf14a_4_presence(void);
+hf14a_pres_t hf14a_4_presence(void);
 
 /** @brief Is the activated card still in the field?
  *

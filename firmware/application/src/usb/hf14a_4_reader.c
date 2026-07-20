@@ -256,46 +256,45 @@ static bool hf14a_4_quick_probe(uint8_t atqa_out[2]) {
 static bool    s_classified   = false;
 static bool    s_is_iso4      = false;
 static uint8_t s_atqa[2]      = {0};
-static uint8_t s_miss         = 0;
 static uint8_t s_scan_fails   = 0;   /* consecutive tier-2 failures */
 static uint8_t s_backoff      = 0;   /* polls left to skip          */
 
-#define HF14A_4_MISS_LIMIT        2   /* consecutive probe misses => absent    */
+/* No miss counter here by design: hysteresis is the caller's policy, applied
+ * once in ccid_slot.c for both this probe and the in-session R(NAK) check. */
 #define HF14A_4_SCAN_FAIL_LIMIT   4   /* failures before we start backing off  */
 #define HF14A_4_UNSELECTABLE_SKIP 3   /* polls to skip once backing off        */
 
 void hf14a_4_presence_reset(void) {
-    s_classified   = false;
-    s_is_iso4      = false;
-    s_miss       = 0;
+    s_classified = false;
+    s_is_iso4    = false;
     s_scan_fails = 0;
     s_backoff    = 0;
     memset(s_atqa, 0, sizeof(s_atqa));
 }
 
-bool hf14a_4_presence(void) {
+hf14a_pres_t hf14a_4_presence(void) {
     reader_mode_enter();               /* idempotent: no-op if already reader  */
 
     /* Tier 1: cheap probe. The common idle case (no card) exits here in a few
      * ms instead of ~2 s. */
     uint8_t atqa[2] = {0};
     if (!hf14a_4_quick_probe(atqa)) {
-        /* Hysteresis: one miss is not a removal. A single WUPA can be lost to a
-         * cold field (the antenna is switched off by session_close and by the
-         * CDC reader hooks) or to momentary detuning, and reporting absent
-         * would tear down the host's connection for no reason. */
-        if (s_classified && ++s_miss < HF14A_4_MISS_LIMIT) return s_is_iso4;
-        hf14a_4_presence_reset();
-        return false;
+        /* Report what we saw and let the caller decide whether one miss is a
+         * removal. The cache is NOT cleared here: a single lost WUPA (cold
+         * field, momentary detuning) must not discard a valid classification --
+         * the caller clears it via hf14a_4_presence_reset() once its hysteresis
+         * actually concludes the card is gone. */
+        return HF14A_PRES_GONE;
     }
-    s_miss = 0;
 
     /* Same card still sitting there -- no need to re-run the costly scan. The
      * ATQA guard catches a swap to a different card type that happens fast
      * enough that no poll saw an empty field (otherwise we would report the
      * previous card's classification). Same ATQA does not prove same card, but
      * a changed one definitely proves a different card, and it is free here. */
-    if (s_classified && memcmp(atqa, s_atqa, sizeof(atqa)) == 0) return s_is_iso4;
+    if (s_classified && memcmp(atqa, s_atqa, sizeof(atqa)) == 0) {
+        return s_is_iso4 ? HF14A_PRES_ISO4 : HF14A_PRES_OTHER;
+    }
     /* Different ATQA => definitely a different card. Drop the cache NOW: if the
      * rescan below fails we would otherwise keep reporting the PREVIOUS card's
      * classification, and a repeatedly-unselectable replacement would hold that
@@ -307,7 +306,7 @@ bool hf14a_4_presence(void) {
      * repeatedly: a card being placed by hand routinely fails its first scans
      * while it settles into the field, and skipping polls then makes arrival
      * detection miss real cards. Stay responsive first, throttle later. */
-    if (s_backoff) { s_backoff--; return false; }
+    if (s_backoff) { s_backoff--; return HF14A_PRES_UNSURE; }
 
     /* Tier 2: newly arrived -- pay for the full scan, since confirming an
      * ISO14443-4 card needs the SAK (anticollision + SELECT). */
@@ -332,7 +331,9 @@ bool hf14a_4_presence(void) {
         if (s_scan_fails >= HF14A_4_SCAN_FAIL_LIMIT) {
             s_backoff = HF14A_4_UNSELECTABLE_SKIP;
         }
-        return false;
+        /* Something IS in the field (WUPA answered) -- it just would not select.
+         * UNSURE, not GONE: a card still settling must not read as a removal. */
+        return HF14A_PRES_UNSURE;
     }
 
     /* Must match what session_open() will accept, otherwise we announce a card
@@ -345,7 +346,7 @@ bool hf14a_4_presence(void) {
     s_scan_fails = 0;
     s_backoff    = 0;
     memcpy(s_atqa, atqa, sizeof(s_atqa));
-    return s_is_iso4;
+    return s_is_iso4 ? HF14A_PRES_ISO4 : HF14A_PRES_OTHER;
 }
 
 bool hf14a_4_session_present(hf14a_4_session_t *s) {

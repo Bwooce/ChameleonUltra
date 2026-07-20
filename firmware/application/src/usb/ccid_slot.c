@@ -33,8 +33,13 @@ static uint32_t m_last_apdu_tick = 0;
  * hardware misses roughly 1 poll in 10 even on a stationary card, so tearing
  * down on a single miss produced false removals mid-session (measured: presence
  * dropping after ~1.4 s while the card was held on the reader for 3 s). */
-#define CCID_PRESENCE_MISS_LIMIT  2
-static uint8_t m_session_miss = 0;
+/* ONE miss counter for BOTH probes. Previously the idle path had its own
+ * hysteresis inside hf14a_4_presence() and the in-session path had another here,
+ * so every session open/close silently reset whichever counter was accumulating.
+ * That seam is where the presence bugs clustered. Value held at 2 through the
+ * restructure so the merge is behaviour-preserving; retune separately. */
+#define CCID_MISS_LIMIT  2
+static uint8_t m_miss = 0;
 
 static bool session_idle_long_enough(void) {
     uint32_t now = app_timer_cnt_get();
@@ -79,7 +84,7 @@ static void presence_lost(void) {
     hf14a_4_session_close(&m_session);
     hf14a_4_presence_reset();
     m_card_present = false;
-    m_session_miss = 0;
+    m_miss = 0;
 }
 
 void ccid_slot_radio_shutdown(void) {
@@ -97,7 +102,25 @@ bool ccid_slot_is_enabled(void)   { return m_ccid_enabled; }
 bool ccid_slot_presence_changed(bool *present) {
     if (radio_is_ours()) {
         if (!m_session.active) {
-            m_card_present = hf14a_4_presence();   /* scan when idle + owned    */
+            /* Idle: the reader reports what it saw, the hysteresis policy lives
+             * here. UNSURE holds the previous state without touching the counter
+             * -- something is in the field, it simply has not selected yet, and
+             * a card still settling must not read as a removal. */
+            switch (hf14a_4_presence()) {
+                case HF14A_PRES_ISO4:
+                    m_card_present = true;  m_miss = 0; break;
+                case HF14A_PRES_OTHER:      /* a card, but not one CCID can use */
+                    m_card_present = false; m_miss = 0; break;
+                case HF14A_PRES_UNSURE:
+                    break;
+                case HF14A_PRES_GONE:
+                    if (++m_miss >= CCID_MISS_LIMIT) {
+                        hf14a_4_presence_reset();
+                        m_card_present = false;
+                        m_miss = 0;
+                    }
+                    break;
+            }
         } else if (session_idle_long_enough()) {
             /* A session blocks the normal scan, and the host does not power the
              * card off on SCardDisconnect(SCARD_LEAVE_CARD) -- so without this
@@ -105,8 +128,8 @@ bool ccid_slot_presence_changed(bool *present) {
              * down (~8-10 s), and cards placed in that window were never
              * reported at all. R(NAK) is transparent to the session. */
             if (hf14a_4_session_present(&m_session)) {
-                m_session_miss = 0;
-            } else if (++m_session_miss >= CCID_PRESENCE_MISS_LIMIT) {
+                m_miss = 0;
+            } else if (++m_miss >= CCID_MISS_LIMIT) {
                 presence_lost();
             }
         }
@@ -261,7 +284,7 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         m_card_present = true;
-        m_session_miss = 0;
+        m_miss = 0;
         /* Start the idle clock here, or the tick still holds a value from a
          * previous session (or 0 at boot), session_idle_long_enough() is true on
          * the very next poll, and R(NAK) fires at a card that has been RATS'd but
@@ -304,12 +327,10 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
              * the presence check. Stamping unconditionally meant a host retrying
              * a lifted card every ~300 ms re-armed the 500 ms idle guard forever,
              * so R(NAK) never ran and presence stayed pinned at "present". */
-            if (++m_session_miss >= CCID_PRESENCE_MISS_LIMIT) {
-                presence_lost();
-            }
+            if (++m_miss >= CCID_MISS_LIMIT) presence_lost();
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
-        m_session_miss = 0;
+        m_miss = 0;
         return build_in_header(resp, RDR_TO_PC_DATABLOCK, rlen, slot, seq,
                                CCID_CMD_STATUS_OK, CCID_ERROR_NONE, 0);
     }
