@@ -350,6 +350,12 @@ bool hf14a_4_presence(void) {
 
 bool hf14a_4_session_present(hf14a_4_session_t *s) {
     if (!s->active) return false;
+    /* Something may have moved us out of reader mode while the session was open
+     * (hw mode -t, a slot change, a button action): tag_mode_enter() calls
+     * pcd_14a_reader_uninit(), so touching the RF registers here would be a raw
+     * SPI write on a torn-down handle. The card is unreachable either way, so
+     * report it gone and let the caller tear the session down. */
+    if (get_device_mode() != DEVICE_MODE_READER) return false;
 
     /* ISO14443-4 presence check: R(NAK) with the CURRENT block number. A card
      * still in the field answers with an R-block; a removed one answers nothing.
@@ -394,12 +400,25 @@ bool hf14a_4_session_present(hf14a_4_session_t *s) {
 void hf14a_4_field_off(void) {
     /* The ONLY antenna-off entry point above rc522. Switching the field off is a
      * POWER decision (disable, radio hold, USB suspend, cable pull, de-config),
-     * never a presence decision -- see hf14a_4_session_close(). */
+     * never a presence decision -- see hf14a_4_session_close().
+     *
+     * MUST be guarded by device mode. pcd_14a_reader_antenna_off() is a bare
+     * clear_register_mask() with NO initialisation check (unlike
+     * pcd_14a_reader_reset(), which does guard) -- so calling it outside reader
+     * mode is a raw SPI write on a handle that tag_mode_enter() has already
+     * torn down via pcd_14a_reader_uninit(), and it hardfaults the device.
+     * Nothing is lost by skipping: tag_mode_enter() switches the field off
+     * itself before uninitialising the reader. */
+    if (get_device_mode() != DEVICE_MODE_READER) return;
     pcd_14a_reader_antenna_off();
 }
 
 void hf14a_4_session_close(hf14a_4_session_t *s) {
-    if (s->active) {
+    /* Same hazard as hf14a_4_field_off(): the DESELECT below is an SPI exchange,
+     * so it must not run once the reader has been uninitialised. Outside reader
+     * mode the field is already down and the card long since released, so
+     * dropping straight to the state reset is correct as well as safe. */
+    if (s->active && get_device_mode() == DEVICE_MODE_READER) {
         /* S(DESELECT): move the card from PROTOCOL to HALT, and LEAVE THE FIELD
          * ON. This matters more than it looks. A RATS'd card sits in PROTOCOL
          * state, where it ignores WUPA -- so if we merely deactivated the
