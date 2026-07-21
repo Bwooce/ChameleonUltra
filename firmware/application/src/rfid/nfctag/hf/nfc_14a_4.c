@@ -12,46 +12,19 @@
 
 #include <string.h>
 #include "nfc_14a_4.h"
+#include "iso14443_4_pcb.h"
 #include "nfc_14a.h"
 #include "tag_emulation.h"
 #include "tag_persistence.h"
 #include "fds_util.h"
 #include "nrf_log.h"
 
-/* ------------------------------------------------------------------ */
-/*  PCB byte constants (ISO14443-4 §7)                                 */
-/* ------------------------------------------------------------------ */
-#define PCB_IBLOCK_MASK     0xC0
-#define PCB_IBLOCK_VAL      0x00
-#define PCB_RBLOCK_MASK     0xE0
-#define PCB_RBLOCK_VAL      0x80   /* R(ACK) = 0xA2/0xA3, R(NAK) = 0xB2/0xB3 */
-#define PCB_SBLOCK_MASK     0xC0
-#define PCB_SBLOCK_VAL      0xC0
-#define PCB_BLOCK_NUM       0x01
-/* ISO14443-4 Table 3 I-block layout is 000 [chain] [CID] [NAD] 1 [blk], which
- * anchors against the values not in dispute: I-block 0x02, R(ACK) 0xA2,
- * R(NAK) 0xB2, S(DESELECT) 0xC2. These three were each defined one bit high. */
-#define PCB_CID_FOLLOWING   0x08  /* b4: CID follows  (was 0x10) */
-#define PCB_NAD_FOLLOWING   0x04  /* b3: NAD follows  (was 0x08) */
-#define PCB_CHAIN           0x10  /* b5: chaining     (was 0x20) */
-/* S(WTX) is 0xF2, matching the S(DESELECT) 0xC2 convention below. 0x30 is not a
- * valid S-block: it dropped the mandatory b2, so the match at the reader-WTX
- * branch compared against 0x30 while a real S(WTX) masks to 0x32 and never
- * matched, and send_wtx() emitted a malformed PCB. */
-#define PCB_SBLOCK_WTX      0xF2
-#define PCB_SBLOCK_DESELECT 0xC2
-#define WTX_VALUE           0x3B   /* WTXM=59 (~3s extra wait) */
+/* PCB constants and predicates now live in rfid/iso14443_4_pcb.h, shared with
+ * the reader paths, with host-side unit tests in firmware/tests/. */
 
-static inline bool is_iblock(uint8_t pcb) {
-    return (pcb & PCB_IBLOCK_MASK) == PCB_IBLOCK_VAL;
-}
-static inline bool is_rblock(uint8_t pcb) {
-    /* R-block: bit7=1, bit6=0, bit2=1, bit1=0 (mask 0xC6, value 0x82) */
-    return (pcb & 0xC6) == 0x82;
-}
-static inline bool is_sblock(uint8_t pcb) {
-    return (pcb & PCB_SBLOCK_MASK) == PCB_SBLOCK_VAL;
-}
+/* WTXM we request when no response is ready yet. Emulation policy rather than a
+ * protocol constant, so it stays local. 0x3B = 59, near the 0x3F maximum. */
+#define WTX_VALUE  0x3B
 
 /* ------------------------------------------------------------------ */
 /*  Module state                                                        */
@@ -182,7 +155,7 @@ static bool find_static_response(const uint8_t *apdu, uint16_t apdu_len,
  * reassembly fix above, though that too is unverified. */
 static void send_iblock(const uint8_t *data, uint16_t len) {
     uint8_t pcb = 0x02 | (m_block_num & 0x01);
-    if (m_cid_supported) pcb |= PCB_CID_FOLLOWING;
+    if (m_cid_supported) pcb |= ISO14443_4_PCB_CID;
     uint8_t off = 0;
     m_tx_buf[off++] = pcb;
     if (m_cid_supported) m_tx_buf[off++] = m_cid & 0x0F;
@@ -209,7 +182,7 @@ static void send_rack(void) {
      * wrong direction. Both bugs are avoided by toggling after transmit. */
     uint8_t pcb = 0xA2 | (m_block_num & 0x01);
     if (m_cid_supported) {
-        pcb |= PCB_CID_FOLLOWING;
+        pcb |= ISO14443_4_PCB_CID;
         uint8_t buf[2] = { pcb, m_cid & 0x0F };
         nfc_tag_14a_tx_bytes(buf, 2, true);
     } else {
@@ -221,7 +194,7 @@ static void send_rack(void) {
 static void send_wtx(void) {
     uint8_t buf[3];
     uint8_t off = 0;
-    buf[off++] = PCB_SBLOCK_WTX | (m_cid_supported ? PCB_CID_FOLLOWING : 0);
+    buf[off++] = ISO14443_4_PCB_S_WTX | (m_cid_supported ? ISO14443_4_PCB_CID : 0);
     if (m_cid_supported) buf[off++] = m_cid & 0x0F;
     buf[off++] = WTX_VALUE;
     nfc_tag_14a_tx_bytes(buf, off, true);
@@ -231,28 +204,60 @@ static void send_wtx(void) {
 /*  State handler (called from NFCT ISR on each received frame)        */
 /* ------------------------------------------------------------------ */
 
-static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBytes) {
-    if (szBytes == 0) return;
+/* The transport hands us a BIT count -- see nfc_tag_14a_state_handler_t in
+ * nfc_14a.h, whose parameter is literally named szBits, and nfc_14a.c which
+ * calls cb_state(p_data, szDataBits).
+ *
+ * This function declared the parameter as szBytes and used it as one, so every
+ * length here was ~8x too large. Consequences, on every single frame:
+ *   - the APDU relayed to the host was over-long and tail-padded with whatever
+ *     followed it in the RX buffer, so relay mode cannot ever have worked;
+ *   - memcpy over-read m_nfc_rx_buffer;
+ *   - the DESELECT echo transmitted ~24 bytes for a 3-byte frame.
+ *
+ * It went unnoticed because find_static_response() is a PREFIX match: an
+ * over-long, garbage-tailed APDU still matches its first cmd_len bytes. The one
+ * path anybody exercised is the one path immune to the defect.
+ *
+ * The received frame INCLUDES the 2-byte CRC and it is counted -- nfc_14a.c
+ * validates RATS as nfc_tag_14a_checks_crc(p_data, 4) for the 4-byte frame
+ * E0 P1 CRC CRC. So strip 2 bytes, and check the CRC, which this layer never
+ * did although MF1 does it on every command. */
+static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBits) {
+    uint16_t szBytes = szBits / 8u;
+    if (szBytes < 3u) return;                          /* PCB + CRC minimum */
+    if (!nfc_tag_14a_checks_crc(data, szBytes)) return;
+    uint16_t frame_len = (uint16_t)(szBytes - 2u);     /* CRC stripped */
+
     uint8_t pcb = data[0];
+    if (!iso14443_4_is_valid_pcb(pcb)) return;         /* b8b7 == 01 is RFU */
 
     /* ---- S-block ---- */
-    if (is_sblock(pcb)) {
-        if ((pcb & 0xF7) == PCB_SBLOCK_DESELECT) {
-            /* Echo DESELECT */
-            nfc_tag_14a_tx_bytes(data, szBytes, true);
+    if (iso14443_4_is_sblock(pcb)) {
+        if (iso14443_4_is_deselect(pcb)) {
+            /* Build a fresh S(DESELECT) rather than echoing the received frame:
+             * the echo re-transmitted the received CRC as payload and, with the
+             * length bug above, sent several times the intended byte count. */
+            uint8_t resp[2];
+            uint8_t off = 0;
+            resp[off++] = (uint8_t)(ISO14443_4_PCB_S_DESELECT |
+                                    (m_cid_supported ? ISO14443_4_PCB_CID : 0u));
+            if (m_cid_supported) resp[off++] = m_cid & 0x0F;
+            nfc_tag_14a_tx_bytes(resp, off, true);
             nfc_tag_14a_4_reset_handler();
             return;
         }
-        if ((pcb & 0x3F) == (PCB_SBLOCK_WTX & 0x3F)) {
-            /* Reader sending WTX — echo back with our WTXM */
-            uint8_t wtxm = (szBytes > 1) ? data[szBytes - 1] & 0x3F : WTX_VALUE;
-            uint8_t resp[3];
-            uint8_t off = 0;
-            resp[off++] = PCB_SBLOCK_WTX | (m_cid_supported ? PCB_CID_FOLLOWING : 0);
-            if (m_cid_supported) resp[off++] = m_cid & 0x0F;
-            resp[off++] = wtxm;
-            nfc_tag_14a_tx_bytes(resp, off, true);
-            /* If we now have a response ready, send it next I-block */
+        if (iso14443_4_is_wtx(pcb)) {
+            /* A received S(WTX) is the reader GRANTING our request, not a
+             * request to us -- S(WTX) is always PICC-initiated. Send exactly
+             * one frame in response: the pending I-block if we have one.
+             *
+             * This used to echo the WTX and then immediately call send_iblock,
+             * i.e. two nfc_tag_14a_tx_bytes calls in one ISR pass. They share a
+             * single TX buffer and neither waits for TXFRAMEEND, so the second
+             * clobbered the first mid-transmission. That is the default path
+             * (send_wtx fires for any APDU with no configured response), not an
+             * edge case. */
             if (m_response_ready) {
                 m_response_ready = false;
                 send_iblock(m_resp_buf, m_resp_len);
@@ -263,32 +268,32 @@ static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBytes) {
     }
 
     /* ---- R-block ---- */
-    if (is_rblock(pcb)) {
+    if (iso14443_4_is_rblock(pcb)) {
+        /* NOTE: R(NAK) is answered with R(ACK) here, which is wrong -- a reader
+         * recovering a lost response gets an acknowledgement instead of the
+         * retransmission, and the exchange deadlocks. Our own reader's presence
+         * check sends exactly this R(NAK) and relies on the retransmit.
+         * Deliberately NOT fixed blind: it is the same block-number state
+         * machine that two inspection-only attempts already got wrong. */
         send_rack();
         return;
     }
 
     /* ---- I-block ---- */
-    if (is_iblock(pcb)) {
-        uint8_t reader_blknum = pcb & PCB_BLOCK_NUM;
-        bool    has_cid       = (pcb & PCB_CID_FOLLOWING) != 0;
-        bool    has_nad       = (pcb & PCB_NAD_FOLLOWING) != 0;
-        bool    more_chain    = (pcb & PCB_CHAIN)         != 0;
+    if (iso14443_4_is_iblock(pcb)) {
+        uint8_t reader_blknum = iso14443_4_blocknum(pcb);
+        bool    more_chain    = iso14443_4_has_chaining(pcb);
 
-        uint8_t offset = 1;
-        if (has_cid) {
-            /* CID acknowledged but not used in responses (keeps protocol simpler) */
-            m_cid_supported = false;
-            offset++;  /* skip CID byte */
-        }
-        if (has_nad) offset++;
-
-        if (offset >= szBytes) {
+        /* Header is PCB plus any CID and NAD bytes; frame_len already excludes
+         * the CRC. Guard uses > not >= so a zero-length I-block -- legal, and
+         * used as a chaining continuation -- is not treated as malformed. */
+        uint8_t offset = iso14443_4_hdr_len(pcb);
+        if (offset > frame_len) {
             send_rack();
             return;
         }
 
-        uint16_t apdu_len = szBytes - offset;
+        uint16_t apdu_len = (uint16_t)(frame_len - offset);
         if (apdu_len > NFC_14A_4_MAX_APDU) apdu_len = NFC_14A_4_MAX_APDU;
 
         m_dbg_iblocks_rx++;
@@ -336,21 +341,29 @@ static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBytes) {
             memcpy(m_apdu_buf, &data[offset], apdu_len);
             m_apdu_len = apdu_len;
         }
-        m_apdu_pending = true;
         m_response_ready = false;
 
         if (more_chain) {
+            /* Mid-chain: the command is incomplete, so do NOT flag it pending.
+             * m_apdu_pending was set before this check, so a host polling
+             * hf14a_4_apdu_recv could collect and act on a partial command. */
             m_chaining_in = true;
             send_rack();
             return;
         }
         m_chaining_in = false;
+        m_apdu_pending = true;
 
         /* APDU complete — check static table first, then WTX */
         {
             uint8_t  *static_resp = NULL;
             uint16_t  static_len  = 0;
-            bool _found = find_static_response(m_apdu_buf, apdu_len,
+            /* Match on the reassembled length, not this fragment's. They are
+             * equal for unchained commands, which is why passing apdu_len went
+             * unnoticed; for a reassembled chain a short final fragment could
+             * fail the length test and miss a valid entry. Introduced alongside
+             * the append fix. */
+            bool _found = find_static_response(m_apdu_buf, m_apdu_len,
                                                &static_resp, &static_len);
             m_dbg_last_match = _found ? 1 : 0;
             NRF_LOG_INFO("14A4 find_static: found=%d static_len=%d resp_count=%d",
@@ -490,7 +503,16 @@ bool nfc_tag_14a_4_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     info.res_coll.uid[6]  = 0x06;
 
     static const uint8_t default_ats[] = {
-        0x10, 0x78, 0x80, 0x70, 0x02, 0x00,
+        /* TL T0 TA TB TC ...
+         * TC(1) is 0x00, not 0x02: b2 of TC advertises CID support, and this
+         * layer cannot provide it. m_cid_supported is never set true anywhere,
+         * so every CID emit path is dead -- a reader that assigned a non-zero
+         * CID would have its I-blocks parsed correctly but answered with no CID
+         * field, and would discard the responses. Our own reader sends CID=0 so
+         * this was unreachable in-tree, but a PC/SC reader may assign one.
+         * Advertising honestly is the cheap fix; real CID support is a state
+         * machine with no way to test it on the hardware here. */
+        0x10, 0x78, 0x80, 0x70, 0x00, 0x00,
         0x31, 0xC1, 0x64, 0x09, 0x97, 0x61,
         0x26, 0x00, 0x90, 0x00
     };
