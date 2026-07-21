@@ -962,6 +962,10 @@ static data_frame_tx_t *cmd_processor_lf_t55xx_write(uint16_t cmd, uint16_t stat
 
 #define GENERIC_READ_LEN 800
 #define GENERIC_READ_TIMEOUT_MS 500
+/* Max I-blocks in one chained response. At >=45 payload bytes per block this is
+ * far more than the 512-byte reassembly buffer can hold, so it only ever fires
+ * on a misbehaving or mis-driven card -- never on legitimate traffic. */
+#define TCL_CHAIN_MAX_BLOCKS 32
 static data_frame_tx_t *cmd_processor_generic_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t *outdata = malloc(GENERIC_READ_LEN);
 
@@ -2554,9 +2558,24 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
     /* ISO14443-4 chaining: the I-block chaining bit is 0x10 (b5), not 0x20.
      * Latent here because this path advertises FSD=256, so a card rarely needs
      * to chain; it fires constantly at the 48-byte FSD used by the CCID path,
-     * where it truncated every response over 45 bytes. */
-    while (resp_pcb & 0x10) {
-        uint8_t rack = 0xA2 | (resp_pcb & 0x01); /* R(ACK) block_num matches received I-block */
+     * where it truncated every response over 45 bytes.
+     *
+     * Bounded: `break` below only fires on a timeout, so a card whose every
+     * exchange SUCCEEDS while the chaining bit stays set spins here forever and
+     * trips the 5 s watchdog. That is not hypothetical -- it resets the device
+     * on a Visa/MC card that sends WTX before its FCI. A reader must never let
+     * a card hang it, whatever the block-number handling turns out to be. */
+    uint16_t chain_guard = 0;
+    while ((resp_pcb & 0x10) && ++chain_guard <= TCL_CHAIN_MAX_BLOCKS) {
+        /* R(ACK) carries the COMPLEMENT of the received I-block's block number.
+         * ISO14443-4 rule E: a PICC advances its chain only when the R(ACK)
+         * block number differs from its own current one. After sending a
+         * chained I-block numbered N the PICC's current number IS N, so
+         * echoing N reads as "not acknowledged" and it retransmits the same
+         * block forever -- observed as an 11x repeat of one 45-byte block from
+         * a Visa Debit card, which spun the loop until the watchdog reset the
+         * device. */
+        uint8_t rack = 0xA2 | ((resp_pcb & 0x01) ^ 0x01);
         uint8_t rack_frame[3];
         rack_frame[0] = rack;
         crc_14a_append(rack_frame, 1);
@@ -2624,7 +2643,8 @@ static bool tcl_apdu_(
     /* Handle card-side chaining ---------------------------------------- */
     uint16_t chain_rbits = 0;   /* hoisted: used in both WTX and R(ACK) paths */
     uint8_t  chain_st    = STATUS_HF_TAG_OK;
-    while (resp_pcb & 0x10u) {   /* 0x10 = I-block chaining, not 0x20 */
+    uint16_t chain_guard2 = 0;   /* see the bound rationale above */
+    while ((resp_pcb & 0x10u) && ++chain_guard2 <= TCL_CHAIN_MAX_BLOCKS) {   /* 0x10 = I-block chaining, not 0x20 */
         if ((resp_pcb & 0xC0u) != 0x00u) {
             /* S-block: handle S(WTX), reject others.
              * Some Visa/MC cards send WTX (PCB=0xF2) before their FCI,
@@ -2658,7 +2678,7 @@ static bool tcl_apdu_(
 
         /* R(ACK) block_num must match the received I-block's block_num */
         uint8_t rf[3];
-        rf[0] = 0xA2u | (resp_pcb & 0x01u);
+        rf[0] = 0xA2u | ((resp_pcb & 0x01u) ^ 0x01u);   /* complement -- see above */
         crc_14a_append(rf, 1);
 
         /* Use bytes_transfer for chain R(ACK) — clear stale RxIRq first */

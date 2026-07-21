@@ -17,6 +17,7 @@
 
 #include "rfid_main.h"
 #include "bsp_delay.h"
+#include "app_timer.h"
 #include "rfid/reader/hf/rc522.h"
 
 #define TCL_RESP_TIMEOUT_MS     600
@@ -87,6 +88,16 @@ bool hf14a_4_session_open(hf14a_4_session_t *s) {
  *
  * Returns true with *rb_out set to the validated length in bytes.
  */
+/* Deadline for the whole APDU exchange, set on entry to hf14a_4_session_apdu.
+ * Single-threaded main-loop context, so a file-scope value is sufficient and
+ * avoids threading a parameter through every call site. */
+static uint32_t m_apdu_start_tick;
+
+static uint32_t apdu_elapsed_ms(void) {
+    uint32_t d = app_timer_cnt_diff_compute(app_timer_cnt_get(), m_apdu_start_tick);
+    return (d * 1000u) / APP_TIMER_CLOCK_FREQ;
+}
+
 static bool tcl_exchange(const uint8_t *frame, uint8_t frame_len, uint8_t blk,
                          uint8_t *rbuf, uint16_t rbuf_bits,
                          uint16_t *rb_out, uint32_t timeout_ms) {
@@ -96,6 +107,17 @@ static bool tcl_exchange(const uint8_t *frame, uint8_t frame_len, uint8_t blk,
     uint8_t crc[2];
 
     for (uint8_t attempt = 0; ; attempt++) {
+        /* Hard cap on total blocking. This runs in main-loop context and the
+         * watchdog is 5 s (NRFX_WDT_CONFIG_RELOAD_VALUE), so an exchange that
+         * retries must still finish well inside that. Adding the R(NAK) retry
+         * without this made the worst case 3 x 600 ms for an I-block plus
+         * 3000 + 600 + 600 ms for an S(WTX) -- about 6 s, which reset the
+         * device on a card that requested WTX. */
+        uint32_t used = apdu_elapsed_ms();
+        if (used >= HF14A_4_APDU_BUDGET_MS) return false;
+        uint32_t left = HF14A_4_APDU_BUDGET_MS - used;
+        if (timeout_ms > left) timeout_ms = left;
+
         write_register_single(ComIrqReg, 0x7F);   /* clear stale RxIRq */
         pcd_14a_reader_timeout_set((uint16_t)timeout_ms);
         uint16_t rbits = 0;
@@ -129,6 +151,8 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                           uint8_t *resp, uint16_t *resp_len, uint16_t resp_max) {
     *resp_len = 0;
     if (!s->active || apdu_len == 0 || apdu_len > HF14A_4_CMD_MAX) return false;
+
+    m_apdu_start_tick = app_timer_cnt_get();   /* arm the total-time budget */
 
     uint8_t abuf[3 + DEF_FIFO_LENGTH];   /* one frame: PCB + payload + CRC */
     uint8_t rbuf[288];
@@ -205,7 +229,12 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
      * chaining at all. It takes a single response longer than FSD (48 here, so
      * >45 payload bytes) to reach this path, e.g. a DESFire ReadData returning
      * 48 bytes of ciphertext plus status. */
-    while (resp_pcb & 0x10u) {
+    /* Bounded as well as time-budgeted: the time budget in tcl_exchange already
+     * caps total blocking, but an explicit block count makes the intent clear
+     * and fails fast rather than burning the whole budget on a card that keeps
+     * the chaining bit set. See the same guard in app_cmd.c's tcl_apdu_. */
+    uint16_t chain_guard = 0;
+    while ((resp_pcb & 0x10u) && ++chain_guard <= HF14A_4_CHAIN_MAX_BLOCKS) {
         if ((resp_pcb & 0xC0u) != 0x00u) {
             /* S-block: echo S(WTX), stop on others (e.g. DESELECT). */
             if ((resp_pcb & 0xF0u) == 0xF0u) {
@@ -241,12 +270,20 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
             break;
         }
 
-        /* R(ACK), block number matching the received I-block. */
+        /* R(ACK) carries the COMPLEMENT of the received I-block's block number.
+         * ISO14443-4 rule E: a PICC advances its chain only when the R(ACK)
+         * block number differs from its own current one. After sending a
+         * chained I-block numbered N the PICC's current number IS N, so
+         * echoing N reads as "not acknowledged" and it retransmits the same
+         * block forever -- observed as an 11x repeat of one 45-byte block from
+         * a Visa Debit card, which spun the loop until the watchdog reset the
+         * device. */
         uint8_t rack[3];
-        rack[0] = (uint8_t)(0xA2u | (resp_pcb & 0x01u));
+        uint8_t ack_blk = (uint8_t)((resp_pcb & 0x01u) ^ 0x01u);
+        rack[0] = (uint8_t)(0xA2u | ack_blk);
         crc_14a_append(rack, 1);
-        /* R(NAK) on retry carries the number we just acknowledged, not s->blk. */
-        if (!tcl_exchange(rack, 3, (uint8_t)(resp_pcb & 0x01u),
+        /* R(NAK) on retry carries the same number we just used for the R(ACK). */
+        if (!tcl_exchange(rack, 3, ack_blk,
                           rbuf, U8ARR_BIT_LEN(rbuf), &rb, TCL_RESP_TIMEOUT_MS)) break;
         resp_pcb = rbuf[0];
         dlen = (uint16_t)(rb - 3u);

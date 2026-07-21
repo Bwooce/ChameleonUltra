@@ -25,6 +25,11 @@
 #define HF14A_4_FIELD_SETTLE_MS  5  /* ISO14443-3 5.1 minimum after field on     */
 #define HF14A_4_SCAN_ATTEMPTS    2  /* tier-2 selects per poll (card settling)   */
 #define HF14A_4_SCAN_RETRY_MS    8  /* settle before the retry                   */
+/* Total wall-clock budget for one APDU exchange, retries and WTX included.
+ * Must stay well under the 5 s watchdog (NRFX_WDT_CONFIG_RELOAD_VALUE) because
+ * this blocks the main loop. */
+#define HF14A_4_APDU_BUDGET_MS 3500
+#define HF14A_4_CHAIN_MAX_BLOCKS 32  /* max I-blocks in one chained response */
 #define HF14A_4_RETRY_MAX    2  /* ISO14443-4 7.5.6 R(NAK) retries before giving up */
 #define HF14A_4_PRESENCE_TIMEOUT_MS 30 /* R(NAK) presence check; card answers in ~1ms */
 #define HF14A_4_TX_FRAME_MAX 48   /* reliable RC522 TX frame cap (== our FSD); */
