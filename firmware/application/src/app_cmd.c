@@ -2575,6 +2575,45 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
          * block forever -- observed as an 11x repeat of one 45-byte block from
          * a Visa Debit card, which spun the loop until the watchdog reset the
          * device. */
+        if ((resp_pcb & 0xC0) != 0x00) {
+            /* S-block. Only S(WTX) is actionable: echo it carrying the card's
+             * own WTXM and wait longer. Anything else (DESELECT) ends it.
+             *
+             * This branch was missing entirely, so an S(WTX) got an R(ACK) in
+             * reply and its WTXM byte was accumulated as if it were APDU data.
+             * Observed on a contactless Mastercard as a 1-byte "response" of
+             * 01 returned with STATUS_HF_TAG_OK. The sibling tcl_apdu_ handled
+             * WTX correctly; this path never did. */
+            if ((resp_pcb & 0xF0) == 0xF0) {
+                if (dlen > 0 && resp_chain_len >= dlen) resp_chain_len -= dlen;
+                uint8_t wtx[4];
+                wtx[0] = resp_pcb;
+                wtx[1] = resp_buf[1];
+                crc_14a_append(wtx, 2);
+                uint8_t wtxm = resp_buf[1] & 0x3F;
+                if (wtxm == 0) wtxm = 1;
+                uint32_t wto = 600u * wtxm;
+                if (wto > 3000u) wto = 3000u;   /* bounded: main-loop context */
+                resp_bits = 0;
+                pcd_14a_reader_timeout_set((uint16_t)wto);
+                status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, wtx, 4,
+                                                       resp_buf, &resp_bits, U8ARR_BIT_LEN(resp_buf));
+                pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+                if (status != STATUS_HF_TAG_OK || resp_bits < 24) break;
+                resp_bytes = resp_bits / 8;
+                crc_14a_calculate(resp_buf, resp_bytes - 2, crc_calc);
+                if (resp_buf[resp_bytes - 2] != crc_calc[0] || resp_buf[resp_bytes - 1] != crc_calc[1]) break;
+                resp_pcb = resp_buf[0];
+                dlen = resp_bytes - 3;
+                if (dlen > 0 && resp_chain_len + dlen < sizeof(resp_chain)) {
+                    memcpy(&resp_chain[resp_chain_len], &resp_buf[1], dlen);
+                    resp_chain_len += dlen;
+                }
+                continue;
+            }
+            break;
+        }
+
         uint8_t rack = 0xA2 | ((resp_pcb & 0x01) ^ 0x01);
         uint8_t rack_frame[3];
         rack_frame[0] = rack;
@@ -2597,6 +2636,12 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
         blk_num ^= 1;
     }
 
+    /* ISO 7816-4 5.1.3: a response APDU always ends in SW1SW2, so anything
+     * shorter is a failed exchange, not a short answer. Reporting OK here gave
+     * the host a buffer with no status word and no way to tell. */
+    if (resp_chain_len < 2) {
+        return data_frame_make(cmd, STATUS_HF_TAG_NO, resp_chain_len, resp_chain);
+    }
     return data_frame_make(cmd, STATUS_HF_TAG_OK, resp_chain_len, resp_chain);
 }
 

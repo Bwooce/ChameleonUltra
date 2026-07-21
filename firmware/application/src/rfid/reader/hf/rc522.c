@@ -878,6 +878,35 @@ uint8_t pcd_14a_reader_ats_request(uint8_t *pAts, uint16_t *szAts, uint16_t szAt
     NRF_LOG_INFO("Received ATS length: %d\n", *szAts);
 
     if (*szAts > 0) { *szAts = *szAts / 8; }
+
+    /* ISO14443-4 5.2.5: honour the PICC's Start-up Frame Guard Time before the
+     * first frame after RATS. SFGI is the low nibble of TB(1) and
+     * SFGT = (256 x 16 / fc) x 2^SFGI, i.e. ~302 us x 2^SFGI.
+     *
+     * We previously sent the first I-block immediately. Lenient cards tolerate
+     * that; a strict one silently ignores the early frame and every APDU then
+     * times out while the card still answers R(NAK) perfectly -- which reads as
+     * "card present but mute". Observed on a contactless Mastercard (SFGI=1):
+     * 3/3 failures back-to-back, 3/3 successes with a few ms of delay.
+     *
+     * TB(1) is present only when T0 bit 0x20 is set, and TA(1) (bit 0x10)
+     * precedes it. Absent TB means SFGI=0, the default. */
+    if (*szAts >= 2) {
+        uint8_t t0 = pAts[1];
+        uint8_t idx = 2;
+        if (t0 & 0x10) idx++;                  /* skip TA(1) */
+        if ((t0 & 0x20) && idx < *szAts) {
+            uint8_t sfgi = pAts[idx] & 0x0F;   /* TB(1) low nibble */
+            if (sfgi > 0 && sfgi <= 14) {      /* 0 = default, 15 = RFU */
+                /* 302 us x 2^sfgi, rounded up to whole ms, clamped: SFGI=14
+                 * would be ~4.9 s, far past the 5 s watchdog. */
+                uint32_t us = 302u << sfgi;
+                uint32_t ms = (us + 999u) / 1000u;
+                if (ms > 50u) ms = 50u;
+                bsp_delay_ms(ms);
+            }
+        }
+    }
     return STATUS_HF_TAG_OK;
 }
 
