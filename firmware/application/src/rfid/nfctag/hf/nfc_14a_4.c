@@ -168,6 +168,18 @@ static bool find_static_response(const uint8_t *apdu, uint16_t apdu_len,
 /*  TX helpers                                                          */
 /* ------------------------------------------------------------------ */
 
+/* KNOWN GAP: card->reader chaining is not implemented.
+ *
+ * This emits the whole response in a single I-block, capped only by our own
+ * buffer -- the reader's FSD is never parsed from its RATS and PCB_CHAIN is
+ * never set on any transmit path. A reader advertising a small FSD (our own
+ * reader hardcodes FSDI=4, i.e. FSD=48) is therefore over-run by any response
+ * above ~45 bytes, which is a protocol violation, not merely a truncation.
+ *
+ * Deliberately not fixed blind: it needs FSDI parsing at RATS time plus a
+ * chunk/R(ACK) state machine, and there is no second reader here to test it
+ * against. Reader->card chaining (the receive direction) IS handled, as of the
+ * reassembly fix above, though that too is unverified. */
 static void send_iblock(const uint8_t *data, uint16_t len) {
     uint8_t pcb = 0x02 | (m_block_num & 0x01);
     if (m_cid_supported) pcb |= PCB_CID_FOLLOWING;
