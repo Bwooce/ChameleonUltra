@@ -67,6 +67,63 @@ bool hf14a_4_session_open(hf14a_4_session_t *s) {
     return true;
 }
 
+/* One T=CL exchange, with ISO14443-4 7.5.6 error recovery.
+ *
+ * Rule 4: on a timeout or an invalid block the PCD retransmits its last block or
+ * sends R(NAK) carrying its current block number, rather than giving up. Rule 5:
+ * a PICC receiving R(NAK) with its own block number retransmits its last block.
+ * We use the R(NAK) form -- one 3-byte frame however long the original was, and
+ * the same probe hf14a_4_session_present() already depends on.
+ *
+ * Without this a single CRC glitch or missed frame failed the whole exchange,
+ * and the compensation had been pushed up into the slot layer as presence
+ * hysteresis (CCID_MISS_LIMIT) and the power-on back-off -- policy standing in
+ * for a transport that gave up where the spec says retry.
+ *
+ * `blk` is the block number to put in the R(NAK), which is the caller's current
+ * one: s->blk for an I-block or an S-block, and the number just echoed for an
+ * R(ACK) mid-chain. Passed explicitly rather than read from the session so each
+ * site states what it means.
+ *
+ * Returns true with *rb_out set to the validated length in bytes.
+ */
+static bool tcl_exchange(const uint8_t *frame, uint8_t frame_len, uint8_t blk,
+                         uint8_t *rbuf, uint16_t rbuf_bits,
+                         uint16_t *rb_out, uint32_t timeout_ms) {
+    const uint8_t *tx = frame;
+    uint8_t tx_len = frame_len;
+    uint8_t rnak[3];
+    uint8_t crc[2];
+
+    for (uint8_t attempt = 0; ; attempt++) {
+        write_register_single(ComIrqReg, 0x7F);   /* clear stale RxIRq */
+        pcd_14a_reader_timeout_set((uint16_t)timeout_ms);
+        uint16_t rbits = 0;
+        uint8_t st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, (uint8_t *)tx, tx_len,
+                                                   rbuf, &rbits, rbuf_bits);
+        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+
+        if (st == STATUS_HF_TAG_OK && rbits >= 24u) {
+            uint16_t rb = rbits / 8u;
+            crc_14a_calculate(rbuf, rb - 2u, crc);
+            if (rbuf[rb - 2] == crc[0] && rbuf[rb - 1] == crc[1]) {
+                *rb_out = rb;
+                return true;
+            }
+        }
+
+        if (attempt >= HF14A_4_RETRY_MAX) return false;
+
+        /* Every retry is an R(NAK); the card answers by resending its last
+         * block, so the original frame is not retransmitted. */
+        rnak[0] = (uint8_t)(0xB2u | (blk & 0x01u));
+        crc_14a_append(rnak, 1);
+        tx = rnak;
+        tx_len = 3;
+        timeout_ms = TCL_RESP_TIMEOUT_MS;
+    }
+}
+
 bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                           const uint8_t *apdu, uint16_t apdu_len,
                           uint8_t *resp, uint16_t *resp_len, uint16_t resp_max) {
@@ -75,7 +132,6 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
 
     uint8_t abuf[3 + DEF_FIFO_LENGTH];   /* one frame: PCB + payload + CRC */
     uint8_t rbuf[288];
-    uint8_t crc[2];
 
     /* Per-frame payload = min(card FSC, reliable RC522 TX frame) - PCB - CRC.
      * The 64B FIFO is unreliable near its limit, so cap well below it and let
@@ -91,20 +147,14 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         abuf[0] = (uint8_t)(0x02 | (s->blk & 0x01) | 0x10);
         memcpy(&abuf[1], &apdu[off], chunk_max);
         crc_14a_append(abuf, chunk_max + 1);
-        write_register_single(ComIrqReg, 0x7F);
-        pcd_14a_reader_timeout_set(TCL_RESP_TIMEOUT_MS);
-        uint16_t abits = 0;
-        uint8_t ast = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, abuf, (uint8_t)(chunk_max + 3),
-                                                    rbuf, &abits, U8ARR_BIT_LEN(rbuf));
-        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+        uint16_t arb = 0;
+        bool aok = tcl_exchange(abuf, (uint8_t)(chunk_max + 3), s->blk,
+                                rbuf, U8ARR_BIT_LEN(rbuf), &arb, TCL_RESP_TIMEOUT_MS);
         /* Any failure here leaves the card mid-chain, expecting further chained
          * I-blocks -- the next APDU would be a protocol violation with undefined
          * recovery. Drop the session so the slot answers ICC_MUTE and the host
          * re-powers, matching what the overflow paths below do. */
-        if (ast != STATUS_HF_TAG_OK || abits < 24u) { hf14a_4_session_close(s); return false; }
-        uint16_t arb = abits / 8u;
-        crc_14a_calculate(rbuf, arb - 2u, crc);
-        if (rbuf[arb - 2] != crc[0] || rbuf[arb - 1] != crc[1]) { hf14a_4_session_close(s); return false; }
+        if (!aok) { hf14a_4_session_close(s); return false; }
         if ((rbuf[0] & 0xF6u) != 0xA2u) { hf14a_4_session_close(s); return false; }   /* expect R(ACK) */
         s->blk ^= 1;
         off += chunk_max;
@@ -117,18 +167,9 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
     crc_14a_append(abuf, last + 1);
     uint8_t frame_len = (uint8_t)(last + 3);
 
-    /* Clear stale RxIRq before transmit (bytes_transfer only clears Set1). */
-    write_register_single(ComIrqReg, 0x7F);
-    pcd_14a_reader_timeout_set(TCL_RESP_TIMEOUT_MS);
-    uint16_t rbits = 0;
-    uint8_t st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, abuf, frame_len,
-                                               rbuf, &rbits, U8ARR_BIT_LEN(rbuf));
-    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-    if (st != STATUS_HF_TAG_OK || rbits < 24u) return false;
-
-    uint16_t rb = rbits / 8u;
-    crc_14a_calculate(rbuf, rb - 2u, crc);
-    if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) return false;
+    uint16_t rb = 0;
+    if (!tcl_exchange(abuf, frame_len, s->blk,
+                      rbuf, U8ARR_BIT_LEN(rbuf), &rb, TCL_RESP_TIMEOUT_MS)) return false;
 
     /* NOTE on the overflow bail-outs below: erroring beats silently truncating
      * (a short APDU response reported as success is corrupt data), but we
@@ -186,16 +227,8 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                 if (wtxm == 0) wtxm = 1;                    /* 0 is not valid  */
                 uint32_t wtx_to = (uint32_t)TCL_RESP_TIMEOUT_MS * wtxm;
                 if (wtx_to > HF14A_4_WTX_TIMEOUT_MAX_MS) wtx_to = HF14A_4_WTX_TIMEOUT_MAX_MS;
-                write_register_single(ComIrqReg, 0x7F);
-                pcd_14a_reader_timeout_set((uint16_t)wtx_to);
-                rbits = 0;
-                st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, wtx, 4,
-                                                   rbuf, &rbits, U8ARR_BIT_LEN(rbuf));
-                pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-                if (st != STATUS_HF_TAG_OK || rbits < 24u) break;
-                rb = rbits / 8u;
-                crc_14a_calculate(rbuf, rb - 2u, crc);
-                if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
+                if (!tcl_exchange(wtx, 4, s->blk,
+                                  rbuf, U8ARR_BIT_LEN(rbuf), &rb, wtx_to)) break;
                 resp_pcb = rbuf[0];
                 dlen = (uint16_t)(rb - 3u);
                 if (dlen > 0) {
@@ -212,16 +245,9 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         uint8_t rack[3];
         rack[0] = (uint8_t)(0xA2u | (resp_pcb & 0x01u));
         crc_14a_append(rack, 1);
-        write_register_single(ComIrqReg, 0x7F);
-        pcd_14a_reader_timeout_set(TCL_RESP_TIMEOUT_MS);
-        rbits = 0;
-        st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, rack, 3,
-                                           rbuf, &rbits, U8ARR_BIT_LEN(rbuf));
-        pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
-        if (st != STATUS_HF_TAG_OK || rbits < 24u) break;
-        rb = rbits / 8u;
-        crc_14a_calculate(rbuf, rb - 2u, crc);
-        if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) break;
+        /* R(NAK) on retry carries the number we just acknowledged, not s->blk. */
+        if (!tcl_exchange(rack, 3, (uint8_t)(resp_pcb & 0x01u),
+                          rbuf, U8ARR_BIT_LEN(rbuf), &rb, TCL_RESP_TIMEOUT_MS)) break;
         resp_pcb = rbuf[0];
         dlen = (uint16_t)(rb - 3u);
         if (dlen > 0) {
