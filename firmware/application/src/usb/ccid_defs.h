@@ -69,8 +69,10 @@
 /* bError values (subset; used with CMD_STATUS_FAILED). */
 #define CCID_ERROR_NONE                 0x00
 #define CCID_ERROR_ICC_MUTE             0xFE /* card did not answer  */
+#define CCID_ERROR_XFR_PARITY           0xFD /* malformed card answer */
 #define CCID_ERROR_XFR_OVERRUN          0xFC
 #define CCID_ERROR_HW_ERROR             0xFB
+#define CCID_ERROR_CMD_ABORTED          0xFF
 #define CCID_ERROR_CMD_SLOT_BUSY        0xE0
 #define CCID_ERROR_CMD_UNSUPPORTED      0x00 /* with slot busy check */
 
@@ -107,6 +109,9 @@
  * @param out      output buffer, must hold at least 5 + hist_len bytes (<= 22)
  * @return number of bytes written to @p out
  */
+uint8_t ccid_ats_historical(const uint8_t *ats, uint8_t ats_len,
+                            uint8_t *out, uint8_t out_max);
+
 uint8_t ccid_pseudo_atr_from_ats(const uint8_t *ats, uint8_t ats_len, uint8_t *out);
 
 /* ---- CCID slot control API (ccid_slot.c) ---------------------------- */

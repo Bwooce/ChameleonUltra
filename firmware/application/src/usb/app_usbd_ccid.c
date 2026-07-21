@@ -208,12 +208,13 @@ static ret_code_t ccid_setup_class_in(app_usbd_class_inst_t const *p_inst,
                                       app_usbd_setup_evt_t const *p_setup) {
     switch (p_setup->setup.bRequest) {
     case CCID_REQ_GET_CLOCK_FREQUENCIES: /* fallthrough */
-    case CCID_REQ_GET_DATA_RATES: {
-        /* No extra clocks/rates advertised (bNum*=0): reply with the single
-         * default dword already implied by the functional descriptor. */
-        static const uint8_t zero4[4] = {0, 0, 0, 0};
-        return app_usbd_core_setup_rsp(&p_setup->setup, zero4, sizeof(zero4));
-    }
+    case CCID_REQ_GET_DATA_RATES:
+        /* CCID 1.1 5.1: with bNumClockSupported and bNumDataRatesSupported both
+         * zero these requests do not apply, and the reader supports only the
+         * descriptor's dwDefaultClock/dwDataRate. Stalling says that. Returning
+         * four zero bytes instead advertised a 0 kHz clock and 0 bps rate --
+         * a wrong answer where a refusal was wanted. */
+        return NRF_ERROR_NOT_SUPPORTED;
     default:
         return NRF_ERROR_NOT_SUPPORTED;
     }

@@ -143,10 +143,23 @@ bool ccid_slot_is_enabled(void)   { return m_ccid_enabled; }
 static uint16_t reader_pseudo_apdu(const uint8_t *apdu, uint16_t len, uint8_t *out) {
     uint8_t ins = (len >= 2) ? apdu[1] : 0x00;
     uint8_t p1  = (len >= 3) ? apdu[2] : 0x00;
+    uint8_t p2  = (len >= 4) ? apdu[3] : 0x00;
     uint8_t le  = (len >= 5) ? apdu[4] : 0x00;   /* 0 == "as much as available" */
     uint16_t n  = 0;
 
-    if (ins == 0xCA && p1 == 0x00) {             /* Get UID */
+    if (ins != 0xCA) {
+        /* CLA FF is supported, this INS is not -- ISO 7816-4 reserves 6D 00 for
+         * exactly that. 6A 81 would claim the instruction exists but the
+         * requested function does not. */
+        out[0] = 0x6D; out[1] = 0x00;
+        return 2;
+    }
+    if (p2 != 0x00) {                            /* PC/SC Part 3 defines P2=0 only */
+        out[0] = 0x6A; out[1] = 0x86;            /* incorrect P1/P2 */
+        return 2;
+    }
+
+    if (p1 == 0x00) {                            /* Get UID */
         uint8_t ulen = m_session.uid_len;
         if (ulen == 0 || ulen > sizeof(m_session.uid)) {
             out[0] = 0x6A; out[1] = 0x88;        /* referenced data not found */
@@ -158,11 +171,25 @@ static uint16_t reader_pseudo_apdu(const uint8_t *apdu, uint16_t len, uint8_t *o
         }
         memcpy(out, m_session.uid, ulen);
         n = ulen;
+    } else if (p1 == 0x01) {
+        /* Get ATS historical bytes. We already hold the ATS from activation and
+         * already locate the historical bytes when synthesising the pseudo-ATR;
+         * pcsc_scan and OpenSC both ask for this. */
+        uint8_t hist[HF14A_4_ATS_MAX];
+        uint8_t hlen = ccid_ats_historical(m_session.ats, m_session.ats_len,
+                                           hist, sizeof(hist));
+        if (hlen == 0) {
+            out[0] = 0x6A; out[1] = 0x88;
+            return 2;
+        }
+        if (le != 0 && le < hlen) {
+            out[0] = 0x6C; out[1] = hlen;
+            return 2;
+        }
+        memcpy(out, hist, hlen);
+        n = hlen;
     } else {
-        /* Every other reader pseudo-APDU (ATS fetch, vendor escapes, direct
-         * transmit) is unimplemented. Say so properly rather than forwarding it
-         * to a card that will answer nonsense. */
-        out[0] = 0x6A; out[1] = 0x81;            /* function not supported */
+        out[0] = 0x6A; out[1] = 0x81;            /* known INS, unsupported P1 */
         return 2;
     }
     out[n++] = 0x90;
@@ -243,26 +270,38 @@ void ccid_slot_invalidate_notify(void) {
  * for ATS 06 75 77 81 02 80 the historical byte is 0x80 and the result is
  * 3B 81 80 01 80 80.
  */
-uint8_t ccid_pseudo_atr_from_ats(const uint8_t *ats, uint8_t ats_len, uint8_t *out) {
-    const uint8_t *hist = 0;
-    uint8_t hist_len = 0;
+/* Locate the historical bytes inside an ATS and copy them out.
+ *
+ * Shared by the pseudo-ATR synthesis and the FF CA 01 00 pseudo-APDU so the two
+ * cannot drift. Returns the number of bytes written, uncapped -- the ATR path
+ * clamps to 15 because T0's K field is a nibble, but Get Data has no such limit.
+ */
+uint8_t ccid_ats_historical(const uint8_t *ats, uint8_t ats_len,
+                            uint8_t *out, uint8_t out_max) {
+    if (ats == 0 || ats_len < 1) return 0;
 
-    if (ats != 0 && ats_len >= 1) {
-        uint8_t tl = ats[0];               /* length byte (includes itself) */
-        uint8_t i = 1;
-        if (tl >= 2 && ats_len >= 2) {
-            uint8_t t0 = ats[1];
-            i = 2;
-            if (t0 & 0x10) i++;            /* TA present */
-            if (t0 & 0x20) i++;            /* TB present */
-            if (t0 & 0x40) i++;            /* TC present */
-        }
-        uint8_t end = (tl <= ats_len) ? tl : ats_len;
-        if (end > i) {
-            hist = &ats[i];
-            hist_len = (uint8_t)(end - i);
-        }
+    uint8_t tl = ats[0];                   /* length byte (includes itself) */
+    uint8_t i = 1;
+    if (tl >= 2 && ats_len >= 2) {
+        uint8_t t0 = ats[1];
+        i = 2;
+        if (t0 & 0x10) i++;                /* TA present */
+        if (t0 & 0x20) i++;                /* TB present */
+        if (t0 & 0x40) i++;                /* TC present */
     }
+    uint8_t end = (tl <= ats_len) ? tl : ats_len;   /* tolerate a trailing CRC */
+    if (end <= i) return 0;
+
+    uint8_t n = (uint8_t)(end - i);
+    if (n > out_max) n = out_max;
+    memcpy(out, &ats[i], n);
+    return n;
+}
+
+uint8_t ccid_pseudo_atr_from_ats(const uint8_t *ats, uint8_t ats_len, uint8_t *out) {
+    uint8_t hist[HF14A_4_ATS_MAX];
+    uint8_t hist_len = ccid_ats_historical(ats, ats_len, hist, sizeof(hist));
+
     if (hist_len > 15) hist_len = 15;      /* nibble field in T0 */
 
     uint8_t n = 0;
@@ -430,6 +469,13 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
         }
         m_miss = 0;
+        /* ISO 7816-4 5.1.3: a response APDU always ends in SW1SW2, so anything
+         * under two bytes is a corrupt exchange. Reporting it as OK hands the
+         * host a buffer with no status word and it cannot tell the difference --
+         * that is how a bare 1-byte answer reached an application as success. */
+        if (rlen < 2) {
+            return fail_datablock(resp, slot, seq, CCID_ERROR_XFR_PARITY);
+        }
         return build_in_header(resp, RDR_TO_PC_DATABLOCK, rlen, slot, seq,
                                CCID_CMD_STATUS_OK, CCID_ERROR_NONE, 0);
     }
@@ -450,6 +496,14 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
                                      CCID_CMD_STATUS_OK, CCID_ERROR_NONE, 0x01 /* T=1 */);
         return n;
     }
+
+    case PC_TO_RDR_ESCAPE:
+        /* No vendor escapes implemented, but the reply must still be an
+         * RDR_to_PC_Escape -- libccid matches on the type, and answering a
+         * SlotStatus to SCardControl looks like a protocol error rather than
+         * an unsupported IOCTL. */
+        return build_in_header(resp, RDR_TO_PC_ESCAPE, 0, slot, seq,
+                               CCID_CMD_STATUS_FAILED, CCID_ERROR_CMD_UNSUPPORTED, 0);
 
     case PC_TO_RDR_ABORT:
         return build_in_header(resp, RDR_TO_PC_SLOTSTATUS, 0, slot, seq,

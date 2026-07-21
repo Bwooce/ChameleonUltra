@@ -2551,8 +2551,11 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
     }
     blk_num ^= 1;
 
-    /* ISO14443-4 chaining: PCB bit5 (0x20) set means more blocks follow */
-    while (resp_pcb & 0x20) {
+    /* ISO14443-4 chaining: the I-block chaining bit is 0x10 (b5), not 0x20.
+     * Latent here because this path advertises FSD=256, so a card rarely needs
+     * to chain; it fires constantly at the 48-byte FSD used by the CCID path,
+     * where it truncated every response over 45 bytes. */
+    while (resp_pcb & 0x10) {
         uint8_t rack = 0xA2 | (resp_pcb & 0x01); /* R(ACK) block_num matches received I-block */
         uint8_t rack_frame[3];
         rack_frame[0] = rack;
@@ -2621,7 +2624,7 @@ static bool tcl_apdu_(
     /* Handle card-side chaining ---------------------------------------- */
     uint16_t chain_rbits = 0;   /* hoisted: used in both WTX and R(ACK) paths */
     uint8_t  chain_st    = STATUS_HF_TAG_OK;
-    while (resp_pcb & 0x20u) {
+    while (resp_pcb & 0x10u) {   /* 0x10 = I-block chaining, not 0x20 */
         if ((resp_pcb & 0xC0u) != 0x00u) {
             /* S-block: handle S(WTX), reject others.
              * Some Visa/MC cards send WTX (PCB=0xF2) before their FCI,
