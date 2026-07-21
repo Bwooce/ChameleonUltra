@@ -3,6 +3,10 @@ All notable changes to this project will be documented in this file.
 This project uses the changelog in accordance with [keepchangelog](http://keepachangelog.com/). Please use this to write notable changes, which is not the same as git commit log...
 
 ## [unreleased][unreleased]
+ - Added USB CCID (PC/SC smart card reader) support on Ultra: the device enumerates as a composite CDC-ACM + CCID device and relays ISO 14443-4 APDUs to and from the card, so it works with any PC/SC application. Enable with `hw settings ccid -e`; disabled by default, and disabling returns the device to card emulation. Supports the PC/SC reader pseudo-APDUs `FF CA 00 00` (Get UID) and `FF CA 01 00` (ATS historical bytes)
+ - Fixed ISO 14443-4 I-block chaining being tested against the wrong PCB bit (0x20 instead of 0x10) in the reader APDU path. Any card response longer than one T=CL frame was silently truncated to its first frame and reported as success, with the last two payload bytes parsed as a status word. Affected `hf 14a` APDU exchanges as well as the new CCID path
+ - Fixed the ISO 14443-4 emulation PCB constants: chaining, CID-following and NAD-following were each defined one bit high, and S(WTX) was defined as 0x30, which is not a valid S-block. Emulated tags therefore mis-parsed chained commands from a reader, and the WTX sent for any APDU without a configured response was malformed
+ - Added ISO 14443-4 section 7.5.6 error recovery to the reader APDU path: a transmission error or timeout is now retried with R(NAK) before the exchange is abandoned
 
 ## [v2.2.0][2026-07-04]
  - Added Jablotron LF protocol support: read, emulate and T55xx clone (@midlan)
