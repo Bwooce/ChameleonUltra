@@ -129,6 +129,47 @@ void ccid_slot_radio_shutdown(void) {
 bool ccid_slot_card_present(void) { return m_card_present; }
 bool ccid_slot_is_enabled(void)   { return m_ccid_enabled; }
 
+
+/* PC/SC Part 3 reserves CLA 0xFF for pseudo-APDUs addressed to the READER rather
+ * than the card, so a compliant reader must answer them itself. We previously
+ * forwarded everything transparently, which meant the standard
+ * "FF CA 00 00" Get-UID -- how most applications read a UID without knowing the
+ * card type -- reached the PICC, which does not recognise CLA FF and replies
+ * with its own error. A DESFire answers a bare native 1C: one status byte, not
+ * even a valid SW1SW2, so the host gets garbage rather than a UID.
+ *
+ * Answered from session state, which already holds the UID from activation.
+ * Returns the response length written to `out`. */
+static uint16_t reader_pseudo_apdu(const uint8_t *apdu, uint16_t len, uint8_t *out) {
+    uint8_t ins = (len >= 2) ? apdu[1] : 0x00;
+    uint8_t p1  = (len >= 3) ? apdu[2] : 0x00;
+    uint8_t le  = (len >= 5) ? apdu[4] : 0x00;   /* 0 == "as much as available" */
+    uint16_t n  = 0;
+
+    if (ins == 0xCA && p1 == 0x00) {             /* Get UID */
+        uint8_t ulen = m_session.uid_len;
+        if (ulen == 0 || ulen > sizeof(m_session.uid)) {
+            out[0] = 0x6A; out[1] = 0x88;        /* referenced data not found */
+            return 2;
+        }
+        if (le != 0 && le < ulen) {              /* Le too small: name the right one */
+            out[0] = 0x6C; out[1] = ulen;
+            return 2;
+        }
+        memcpy(out, m_session.uid, ulen);
+        n = ulen;
+    } else {
+        /* Every other reader pseudo-APDU (ATS fetch, vendor escapes, direct
+         * transmit) is unimplemented. Say so properly rather than forwarding it
+         * to a card that will answer nonsense. */
+        out[0] = 0x6A; out[1] = 0x81;            /* function not supported */
+        return 2;
+    }
+    out[n++] = 0x90;
+    out[n++] = 0x00;
+    return n;
+}
+
 bool ccid_slot_presence_changed(bool *present) {
     if (radio_is_ours()) {
         m_field_up = true;              /* the polls below drive the antenna */
@@ -363,6 +404,14 @@ uint16_t ccid_slot_process(const uint8_t *msg, uint16_t msg_len,
     case PC_TO_RDR_XFRBLOCK: {
         if (!radio_available || !m_session.active) {
             return fail_datablock(resp, slot, seq, CCID_ERROR_ICC_MUTE);
+        }
+        /* Reader pseudo-APDUs (CLA 0xFF) are for us, not the card -- see
+         * reader_pseudo_apdu(). Answer before touching the RF layer. */
+        if (dlen >= 4 && msg[CCID_OFF_DATA] == 0xFF) {
+            uint16_t plen = reader_pseudo_apdu(&msg[CCID_OFF_DATA], (uint16_t)dlen,
+                                               &resp[CCID_OFF_DATA]);
+            return build_in_header(resp, RDR_TO_PC_DATABLOCK, plen, slot, seq,
+                                   CCID_CMD_STATUS_OK, CCID_ERROR_NONE, 0);
         }
         uint16_t rlen = 0;
         bool ok = hf14a_4_session_apdu(&m_session, &msg[CCID_OFF_DATA], (uint16_t)dlen,
