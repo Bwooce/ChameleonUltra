@@ -193,13 +193,20 @@ static void send_iblock(const uint8_t *data, uint16_t len) {
 }
 
 static void send_rack(void) {
-    /* Toggle BEFORE building the R(ACK). ISO14443-4 rule B has the reader
-     * toggle when it receives an R(ACK) carrying its current block number, so
-     * acknowledging with the un-toggled value made the reader's next chunk
-     * arrive with the opposite number -- which this code then misread as a
-     * retransmission and answered by resending its last response mid-command.
-     * NOT VERIFIED ON HARDWARE. */
-    m_block_num ^= 1;
+    /* The R(ACK) carries the SAME block number as the I-block it acknowledges,
+     * and m_block_num is toggled AFTER transmit -- mirroring send_iblock().
+     *
+     * This file uses the pre-toggled convention: m_block_num holds the number
+     * to send NEXT. On receiving I(chain) blk=0 it already holds 0, which is
+     * the correct R(ACK) number, so the toggle must come after the frame is
+     * built, not before.
+     *
+     * History worth keeping: the original code sent the right number but never
+     * toggled, so the reader's next chunk arrived with a number that no longer
+     * matched and fell into the retransmission branch. A previous fix moved a
+     * toggle to the TOP of this function, which corrected the advance but made
+     * every R(ACK) carry a number one off -- a right diagnosis fixed in the
+     * wrong direction. Both bugs are avoided by toggling after transmit. */
     uint8_t pcb = 0xA2 | (m_block_num & 0x01);
     if (m_cid_supported) {
         pcb |= PCB_CID_FOLLOWING;
@@ -208,6 +215,7 @@ static void send_rack(void) {
     } else {
         nfc_tag_14a_tx_bytes(&pcb, 1, true);
     }
+    m_block_num ^= 1;      /* after transmit, exactly as send_iblock() does */
 }
 
 static void send_wtx(void) {
