@@ -150,8 +150,21 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
         out += dlen;
     }
 
-    /* Card-side chaining: PCB bit5 (0x20) => more blocks follow. */
-    while (resp_pcb & 0x20u) {
+    /* Card-side chaining: the I-block chaining bit is 0x10, NOT 0x20.
+     *
+     * This was tested as 0x20 and so never fired: any card response larger than
+     * one T=CL frame was silently truncated to its first frame, and the host
+     * parsed the last two payload bytes as SW1SW2 and got nonsense. Note the
+     * outbound path above already uses the correct 0x10 when it SETS the bit --
+     * the two directions disagreed.
+     *
+     * Nothing caught this for a long time because DESFire's own 91 AF mechanism
+     * is APPLICATION-level chaining -- separate APDU round trips, each fitting
+     * in one frame -- so GetVersion and friends never exercise T=CL response
+     * chaining at all. It takes a single response longer than FSD (48 here, so
+     * >45 payload bytes) to reach this path, e.g. a DESFire ReadData returning
+     * 48 bytes of ciphertext plus status. */
+    while (resp_pcb & 0x10u) {
         if ((resp_pcb & 0xC0u) != 0x00u) {
             /* S-block: echo S(WTX), stop on others (e.g. DESELECT). */
             if ((resp_pcb & 0xF0u) == 0xF0u) {
