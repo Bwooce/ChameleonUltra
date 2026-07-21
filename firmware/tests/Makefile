@@ -21,3 +21,12 @@ clean:
 	rm -f $(BINS)
 
 .PHONY: all test clean
+
+# emulation_bench.py is the HARDWARE counterpart to the tests above: it drives
+# the emulated tag from a second PC/SC reader, which is the only way to execute
+# nfc_14a_4.c at all. Needs `pip3 install pyscard` and a reader that is not the
+# Chameleon. Not wired into `make test` because it needs hardware present.
+bench:
+	python3 emulation_bench.py
+
+.PHONY: bench
