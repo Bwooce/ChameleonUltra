@@ -28,10 +28,17 @@
 #define PCB_SBLOCK_MASK     0xC0
 #define PCB_SBLOCK_VAL      0xC0
 #define PCB_BLOCK_NUM       0x01
-#define PCB_CID_FOLLOWING   0x10  /* bit4: CID follows */
-#define PCB_NAD_FOLLOWING   0x08  /* bit3: NAD follows */
-#define PCB_CHAIN           0x20  /* bit5: chaining flag per ISO14443-4 Table 3 */
-#define PCB_SBLOCK_WTX      0x30
+/* ISO14443-4 Table 3 I-block layout is 000 [chain] [CID] [NAD] 1 [blk], which
+ * anchors against the values not in dispute: I-block 0x02, R(ACK) 0xA2,
+ * R(NAK) 0xB2, S(DESELECT) 0xC2. These three were each defined one bit high. */
+#define PCB_CID_FOLLOWING   0x08  /* b4: CID follows  (was 0x10) */
+#define PCB_NAD_FOLLOWING   0x04  /* b3: NAD follows  (was 0x08) */
+#define PCB_CHAIN           0x10  /* b5: chaining     (was 0x20) */
+/* S(WTX) is 0xF2, matching the S(DESELECT) 0xC2 convention below. 0x30 is not a
+ * valid S-block: it dropped the mandatory b2, so the match at the reader-WTX
+ * branch compared against 0x30 while a real S(WTX) masks to 0x32 and never
+ * matched, and send_wtx() emitted a malformed PCB. */
+#define PCB_SBLOCK_WTX      0xF2
 #define PCB_SBLOCK_DESELECT 0xC2
 #define WTX_VALUE           0x3B   /* WTXM=59 (~3s extra wait) */
 
