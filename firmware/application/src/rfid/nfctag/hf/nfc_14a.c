@@ -9,6 +9,7 @@
 NRF_LOG_MODULE_REGISTER();
 
 #include "hex_utils.h"
+#include "iso14443_4_pcb.h"
 #include "crc_utils.h"
 #include "nfc_mf1.h"
 #include "byte_mirror.h"
@@ -48,12 +49,17 @@ nfc_tag_14a_handler_t m_tag_handler = {
 };
 
 // RATS FSDI length check table
-const uint16_t ats_fsdi_table[] = {
-    // 0 - 8
-    16, 24, 32, 40, 48, 64, 96, 128, 256,
-    // 9 - F
-    256, 256, 256, 256, 256, 256, 256,
-};
+/* FSDI table moved to rfid/iso14443_4_pcb.h (iso14443_4_frame_size), shared with
+ * the reader paths and unit-tested in firmware/tests/. */
+
+/* Largest frame the READER said it can accept, latched from the FSDI nibble of
+ * its RATS. Previously the FSDI was decoded here, used once to clamp the ATS
+ * reply, and thrown away -- so the emulation layer had no idea how large a
+ * frame it was allowed to send and emitted whole responses in one go regardless.
+ * Defaults to the ISO minimum of 32 until a RATS is seen. */
+static uint16_t m_reader_fsd = 32;
+
+uint16_t nfc_tag_14a_get_reader_fsd(void) { return m_reader_fsd; }
 
 // Whether it is responding to
 static volatile bool m_is_responded = false;
@@ -566,7 +572,9 @@ void nfc_tag_14a_data_process(uint8_t *p_data) {
                     // Make sure the sub -packaging opens the support of ATS
                     if (auto_coll_res->ats->length > 0) {
                         // Take out FSD and return according to the maximum FSD
-                        uint8_t fsd = ats_fsdi_table[p_data[1] >> 4 & 0x0F] - 2;
+                        m_reader_fsd = iso14443_4_frame_size((uint8_t)(p_data[1] >> 4));
+                        NRF_LOG_INFO("14A4 RATS: reader FSD=%d", m_reader_fsd);
+                        uint8_t fsd = (uint8_t)(m_reader_fsd - 2);
                         // If the FSD is larger than the set of ATS, then returns normal ATS data, otherwise the data of the FSD limited length will be returned
                         uint8_t len = fsd >= auto_coll_res->ats->length ? auto_coll_res->ats->length : fsd;
                         // Back to ATS data according to FSD, FSD is the largest frame size supported by PCD. After removing CRC, it is the actual data frame size support

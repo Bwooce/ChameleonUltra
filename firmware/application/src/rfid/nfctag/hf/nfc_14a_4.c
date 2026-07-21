@@ -144,15 +144,20 @@ static bool find_static_response(const uint8_t *apdu, uint16_t apdu_len,
 /* KNOWN GAP: card->reader chaining is not implemented.
  *
  * This emits the whole response in a single I-block, capped only by our own
- * buffer -- the reader's FSD is never parsed from its RATS and PCB_CHAIN is
- * never set on any transmit path. A reader advertising a small FSD (our own
- * reader hardcodes FSDI=4, i.e. FSD=48) is therefore over-run by any response
- * above ~45 bytes, which is a protocol violation, not merely a truncation.
+ * buffer, so a reader advertising a small FSD is over-run by any longer
+ * response -- a protocol violation, not merely a truncation. Our own reader
+ * hardcodes FSDI=4 (FSD=48), so Chameleon-to-Chameleon breaks above ~45 bytes.
  *
- * Deliberately not fixed blind: it needs FSDI parsing at RATS time plus a
- * chunk/R(ACK) state machine, and there is no second reader here to test it
- * against. Reader->card chaining (the receive direction) IS handled, as of the
- * reassembly fix above, though that too is unverified. */
+ * The reader's FSD is now available -- nfc_tag_14a_get_reader_fsd() latches it
+ * from the RATS -- and the chunk size that would be needed is logged below, so
+ * the arithmetic can be checked against a real reader before any chunking code
+ * is written. What is still missing is the state machine: emit with the
+ * chaining bit set, then send the next chunk on each R(ACK), tracking the
+ * offset and block number.
+ *
+ * Deliberately not written blind. It shares the block-number handling that two
+ * inspection-only attempts have already got wrong, and there is no second
+ * reader here to test against. */
 static void send_iblock(const uint8_t *data, uint16_t len) {
     uint8_t pcb = 0x02 | (m_block_num & 0x01);
     if (m_cid_supported) pcb |= ISO14443_4_PCB_CID;
@@ -160,6 +165,19 @@ static void send_iblock(const uint8_t *data, uint16_t len) {
     m_tx_buf[off++] = pcb;
     if (m_cid_supported) m_tx_buf[off++] = m_cid & 0x0F;
     if (len > NFC_14A_4_MAX_APDU) len = NFC_14A_4_MAX_APDU;
+    /* Diagnostic only -- see the gap note above. When this fires, the frame we
+     * are about to send exceeds what the reader told us it can accept, and the
+     * exchange is expected to fail. Logging it makes the failure legible
+     * instead of looking like a dead card. */
+    {
+        uint16_t fsd  = nfc_tag_14a_get_reader_fsd();
+        uint16_t cap  = iso14443_4_max_payload(fsd, m_cid_supported, false);
+        if (len > cap) {
+            NRF_LOG_WARNING("14A4 response %d B exceeds reader FSD %d (cap %d): "
+                            "card->reader chaining not implemented",
+                            len, fsd, cap);
+        }
+    }
     memcpy(&m_tx_buf[off], data, len);
     nfc_tag_14a_tx_bytes(m_tx_buf, off + len, true);
     m_block_num ^= 1;

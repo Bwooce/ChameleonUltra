@@ -122,6 +122,11 @@ void nfc_tag_14a_append_bcc(uint8_t *pbtData, size_t szLen);
 void nfc_tag_14a_append_crc(uint8_t *pbtData, size_t szLen);
 bool nfc_tag_14a_checks_crc(uint8_t *pbtData, size_t szLen);
 
+/* Largest frame the reader will accept, from the FSDI in its RATS. 32 (the ISO
+ * minimum) until a RATS has been seen. Card->reader chaining needs this to size
+ * its chunks; nothing consumes it for that yet. */
+uint16_t nfc_tag_14a_get_reader_fsd(void);
+
 // 14A frame combination
 uint8_t nfc_tag_14a_wrap_frame(const uint8_t *pbtTx, const size_t szTxBits, const uint8_t *pbtTxPar, uint8_t *pbtFrame);
 uint8_t nfc_tag_14a_unwrap_frame(const uint8_t *pbtFrame, const size_t szFrameBits, uint8_t *pbtRx, uint8_t *pbtRxPar);
