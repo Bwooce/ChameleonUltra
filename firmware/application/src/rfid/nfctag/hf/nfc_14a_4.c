@@ -64,6 +64,7 @@ static nfc_tag_14a_coll_res_reference_t m_shadow_coll_res;
 /* T=CL session state */
 static uint8_t  m_block_num      = 0;
 static bool     m_cid_supported  = false;
+static bool     m_chaining_in    = false;   /* mid reassembly of a chained command */
 static uint8_t  m_cid            = 0;
 static uint8_t  m_apdu_buf[NFC_14A_4_MAX_APDU];
 static uint16_t m_apdu_len       = 0;
@@ -180,6 +181,13 @@ static void send_iblock(const uint8_t *data, uint16_t len) {
 }
 
 static void send_rack(void) {
+    /* Toggle BEFORE building the R(ACK). ISO14443-4 rule B has the reader
+     * toggle when it receives an R(ACK) carrying its current block number, so
+     * acknowledging with the un-toggled value made the reader's next chunk
+     * arrive with the opposite number -- which this code then misread as a
+     * retransmission and answered by resending its last response mid-command.
+     * NOT VERIFIED ON HARDWARE. */
+    m_block_num ^= 1;
     uint8_t pcb = 0xA2 | (m_block_num & 0x01);
     if (m_cid_supported) {
         pcb |= PCB_CID_FOLLOWING;
@@ -284,15 +292,39 @@ static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBytes) {
             return;
         }
 
-        memcpy(m_apdu_buf, &data[offset], apdu_len);
-        m_apdu_len    = apdu_len;
+        /* Reader->card chaining: APPEND each fragment. This overwrote the buffer
+         * with every chunk, so only the final fragment survived and the
+         * reassembled command was garbage. Unreachable until 49fcc10 corrected
+         * PCB_CHAIN from 0x20 to 0x10, which is why it was never noticed.
+         *
+         * NOT VERIFIED ON HARDWARE: exercising it needs a reader that chains a
+         * command, and there is only one Chameleon here. Correct by inspection
+         * only -- treat with suspicion. */
+        if (m_chaining_in) {
+            if ((uint16_t)m_apdu_len + apdu_len <= sizeof(m_apdu_buf)) {
+                memcpy(&m_apdu_buf[m_apdu_len], &data[offset], apdu_len);
+                m_apdu_len = (uint16_t)(m_apdu_len + apdu_len);
+            } else {
+                /* Oversized chained command: drop it rather than truncate
+                 * silently, and reset so the next command starts clean. */
+                m_chaining_in = false;
+                m_apdu_len = 0;
+                send_rack();
+                return;
+            }
+        } else {
+            memcpy(m_apdu_buf, &data[offset], apdu_len);
+            m_apdu_len = apdu_len;
+        }
         m_apdu_pending = true;
         m_response_ready = false;
 
         if (more_chain) {
+            m_chaining_in = true;
             send_rack();
             return;
         }
+        m_chaining_in = false;
 
         /* APDU complete — check static table first, then WTX */
         {
@@ -349,6 +381,7 @@ void nfc_tag_14a_4_set_response(const uint8_t *data, uint16_t length) {
 void nfc_tag_14a_4_reset_handler(void) {
     m_block_num      = 0;
     m_cid_supported  = false;
+    m_chaining_in    = false;
     m_cid            = 0;
     m_apdu_pending   = false;
     m_response_ready = false;

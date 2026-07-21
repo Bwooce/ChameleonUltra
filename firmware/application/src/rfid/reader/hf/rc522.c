@@ -892,17 +892,27 @@ uint8_t pcd_14a_reader_ats_request(uint8_t *pAts, uint16_t *szAts, uint16_t szAt
      * TB(1) is present only when T0 bit 0x20 is set, and TA(1) (bit 0x10)
      * precedes it. Absent TB means SFGI=0, the default. */
     if (*szAts >= 2) {
+        uint8_t tl  = pAts[0];                 /* TL covers the ATS proper      */
+        uint8_t end = (tl <= *szAts) ? tl : (uint8_t)*szAts;  /* *szAts still includes CRC */
         uint8_t t0 = pAts[1];
         uint8_t idx = 2;
         if (t0 & 0x10) idx++;                  /* skip TA(1) */
-        if ((t0 & 0x20) && idx < *szAts) {
+        if ((t0 & 0x20) && idx < end) {
             uint8_t sfgi = pAts[idx] & 0x0F;   /* TB(1) low nibble */
-            if (sfgi > 0 && sfgi <= 14) {      /* 0 = default, 15 = RFU */
-                /* 302 us x 2^sfgi, rounded up to whole ms, clamped: SFGI=14
-                 * would be ~4.9 s, far past the 5 s watchdog. */
+            if (sfgi == 0x0F) sfgi = 14;       /* RFU: treat as maximum, not as "no wait" */
+            if (sfgi > 0) {
+                /* SFGT = ~302 us x 2^SFGI, rounded up to whole ms.
+                 * Clamped because SFGI=14 is ~4.9 s and the watchdog is 5 s.
+                 * The clamp is a real limitation: a strict card with SFGI >= 11
+                 * gets less than it asked for and may go mute again, so log it
+                 * rather than let it fail silently the way the missing wait did. */
                 uint32_t us = 302u << sfgi;
                 uint32_t ms = (us + 999u) / 1000u;
-                if (ms > 50u) ms = 50u;
+                if (ms > 500u) {
+                    NRF_LOG_WARNING("SFGT clamped: SFGI=%d wants %lu ms, waiting 500 ms",
+                                    sfgi, (unsigned long)ms);
+                    ms = 500u;
+                }
                 bsp_delay_ms(ms);
             }
         }

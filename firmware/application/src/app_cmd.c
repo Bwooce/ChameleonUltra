@@ -1,3 +1,4 @@
+#include "app_timer.h"
 #include "fds_util.h"
 #include "bsp_time.h"
 #include "bsp_delay.h"
@@ -966,6 +967,23 @@ static data_frame_tx_t *cmd_processor_lf_t55xx_write(uint16_t cmd, uint16_t stat
  * far more than the 512-byte reassembly buffer can hold, so it only ever fires
  * on a misbehaving or mis-driven card -- never on legitimate traffic. */
 #define TCL_CHAIN_MAX_BLOCKS 32
+/* Total wall-clock budget for one T=CL exchange, S(WTX) and all. These loops run
+ * in main-loop context and nothing feeds the watchdog inside them, so the cap
+ * must sit well under NRFX_WDT_CONFIG_RELOAD_VALUE (5000 ms). A block COUNT cap
+ * alone does not bound time: a card granting two consecutive 3000 ms S(WTX)
+ * extensions -- ordinary for EMV crypto -- already exceeds the watchdog, and 32
+ * of them would be ~96 s. */
+#define TCL_APDU_BUDGET_MS 3500
+
+static uint32_t m_tcl_start_tick;
+
+static inline void tcl_budget_arm(void) { m_tcl_start_tick = app_timer_cnt_get(); }
+
+static uint32_t tcl_budget_left_ms(void) {
+    uint32_t d = app_timer_cnt_diff_compute(app_timer_cnt_get(), m_tcl_start_tick);
+    uint32_t used = (d * 1000u) / APP_TIMER_CLOCK_FREQ;
+    return (used >= TCL_APDU_BUDGET_MS) ? 0u : (TCL_APDU_BUDGET_MS - used);
+}
 static data_frame_tx_t *cmd_processor_generic_read(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     uint8_t *outdata = malloc(GENERIC_READ_LEN);
 
@@ -2517,6 +2535,11 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
 
     NRF_LOG_INFO("14A4_READER_APDU: sending I-block, frame_len=%d", frame_len);
 
+    /* Clear stale RxIRq before transmit: bytes_transfer only clears Set1, so a
+     * leftover RxIRq makes the wait loop exit instantly and return FIFO
+     * garbage. Both sibling implementations do this; this path never did. */
+    write_register_single(ComIrqReg, 0x7F);
+    tcl_budget_arm();
     pcd_14a_reader_timeout_set(600);
     resp_bits = 0;
     status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE,
@@ -2556,9 +2579,12 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
     blk_num ^= 1;
 
     /* ISO14443-4 chaining: the I-block chaining bit is 0x10 (b5), not 0x20.
-     * Latent here because this path advertises FSD=256, so a card rarely needs
-     * to chain; it fires constantly at the 48-byte FSD used by the CCID path,
-     * where it truncated every response over 45 bytes.
+     * CORRECTION: an earlier note here claimed this path advertises FSD=256 and
+     * so rarely chains. That was wrong. pcd_14a_reader_ats_request() hardcodes
+     * RATS with FSDI=4, i.e. FSD=48, for EVERY caller in the firmware, so a card
+     * chunks at 45 payload bytes and chaining fires on any longer response --
+     * every real EMV FCI. The false premise is what justified deprioritising
+     * the block-number and truncation defects in this path.
      *
      * Bounded: `break` below only fires on a timeout, so a card whose every
      * exchange SUCCEEDS while the chaining bit stays set spins here forever and
@@ -2594,7 +2620,11 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
                 if (wtxm == 0) wtxm = 1;
                 uint32_t wto = 600u * wtxm;
                 if (wto > 3000u) wto = 3000u;   /* bounded: main-loop context */
+                uint32_t left = tcl_budget_left_ms();
+                if (left == 0u) break;          /* out of budget: watchdog guard */
+                if (wto > left) wto = left;
                 resp_bits = 0;
+                write_register_single(ComIrqReg, 0x7F);
                 pcd_14a_reader_timeout_set((uint16_t)wto);
                 status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, wtx, 4,
                                                        resp_buf, &resp_bits, U8ARR_BIT_LEN(resp_buf));
@@ -2619,7 +2649,12 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
         rack_frame[0] = rack;
         crc_14a_append(rack_frame, 1);
         resp_bits = 0;
-        pcd_14a_reader_timeout_set(600);
+        {
+            uint32_t left = tcl_budget_left_ms();
+            if (left == 0u) break;              /* out of budget: watchdog guard */
+            write_register_single(ComIrqReg, 0x7F);
+            pcd_14a_reader_timeout_set((uint16_t)(left < 600u ? left : 600u));
+        }
         status = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE,
                                                rack_frame, 3, resp_buf, &resp_bits, U8ARR_BIT_LEN(resp_buf));
         pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
@@ -2636,6 +2671,15 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
         blk_num ^= 1;
     }
 
+    /* An incomplete chain is a FAILED exchange, not a short response. Every
+     * `break` above and exhausting TCL_CHAIN_MAX_BLOCKS leave the chaining bit
+     * set, so this single test covers a mid-chain timeout, CRC failure,
+     * unexpected S-block and the block cap alike. Returning the fragment with
+     * OK let the host parse the last two bytes of a mid-response chunk as
+     * SW1SW2 -- the same corruption the 0x20 bug caused, by another route. */
+    if (resp_pcb & 0x10) {
+        return data_frame_make(cmd, STATUS_HF_TAG_NO, 0, NULL);
+    }
     /* ISO 7816-4 5.1.3: a response APDU always ends in SW1SW2, so anything
      * shorter is a failed exchange, not a short answer. Reporting OK here gave
      * the host a buffer with no status word and no way to tell. */
@@ -2665,10 +2709,12 @@ static bool tcl_apdu_(
      * RxIRq (bit4) stays set from the previous receive and causes the
      * wait-loop to exit instantly, returning garbage from FIFO. */
     write_register_single(ComIrqReg, 0x7F);
+    tcl_budget_arm();
     pcd_14a_reader_timeout_set(600);
     uint16_t rbits = 0;
     uint8_t st = pcd_14a_reader_bytes_transfer(
                      PCD_TRANSCEIVE, abuf, frame_len, rbuf, &rbits, 270u * 8u);
+    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);   /* was never restored here */
     if (st != STATUS_HF_TAG_OK || rbits < 24u) return false;
 
     uint16_t rb = rbits / 8u;
@@ -2676,8 +2722,13 @@ static bool tcl_apdu_(
     crc_14a_calculate(rbuf, rb - 2u, crc);
     if (rbuf[rb - 2] != crc[0] || rbuf[rb - 1] != crc[1]) return false;
 
-    *blk_p ^= 1;
     uint8_t  resp_pcb  = rbuf[0];
+    /* ISO14443-4 rule B: toggle on every received I-block, including each block
+     * of a chained response. `blk = received ^ 1` implements it exactly. The
+     * old `*blk_p ^= 1` toggled once per APDU, so an even-length chain left the
+     * session out of step and the card retransmitted its previous response to
+     * the NEXT command -- e.g. the PPSE FCI answering SELECT AID. */
+    *blk_p = (uint8_t)((resp_pcb & 0x01u) ^ 0x01u);
     uint16_t chain_len = 0;
     uint8_t  dlen      = (uint8_t)(rb - 3u);
     if (dlen > 0 && dlen < 512u) {
@@ -2696,13 +2747,20 @@ static bool tcl_apdu_(
              * requesting more processing time. We must echo it back.
              * The WTXM byte was spuriously added to chain_buf — undo it. */
             if ((resp_pcb & 0xF0u) == 0xF0u) {
-                chain_len -= dlen;       /* remove spurious WTXM byte(s) */
+                if (dlen > 0u && chain_len >= dlen) chain_len -= dlen;   /* WTXM is not data */
                 uint8_t wtx_r[4];
                 wtx_r[0] = resp_pcb;    /* mirror the S(WTX) PCB */
                 wtx_r[1] = rbuf[1];     /* WTXM from last received frame */
                 crc_14a_append(wtx_r, 2);
                 write_register_single(ComIrqReg, 0x7F);
-                pcd_14a_reader_timeout_set(600);
+                uint8_t wtxm_ = rbuf[1] & 0x3Fu;
+                if (wtxm_ == 0u) wtxm_ = 1u;
+                uint32_t wto_ = 600u * wtxm_;          /* honour WTXM: was a flat 600 ms */
+                if (wto_ > 3000u) wto_ = 3000u;
+                uint32_t left_ = tcl_budget_left_ms();
+                if (left_ == 0u) break;                /* out of budget: watchdog guard */
+                if (wto_ > left_) wto_ = left_;
+                pcd_14a_reader_timeout_set((uint16_t)wto_);
                 chain_rbits = 0;
                 chain_st = pcd_14a_reader_bytes_transfer(
                                PCD_TRANSCEIVE, wtx_r, 4, rbuf, &chain_rbits, 270u * 8u);
@@ -2748,6 +2806,9 @@ static bool tcl_apdu_(
 
     *rdata_ptr = chain_buf;
     *rlen_ptr  = chain_len;
+    /* Incomplete chain == failed exchange. See the matching guard in
+     * cmd_processor_hf14a_4_reader_apdu and hf14a_4_session_apdu. */
+    if (resp_pcb & 0x10u) return false;
     return chain_len > 0u;
 }
 
@@ -2773,7 +2834,7 @@ static data_frame_tx_t *cmd_processor_hf14a_4_emv_scan(uint16_t cmd, uint16_t st
 
     /* ---- helpers -------------------------------------------------- */
     static uint8_t  abuf[64];   /* TX frame: PCB + APDU + CRC */
-    static uint8_t  rbuf[270];  /* single-frame receive buffer: up to 256 bytes data + PCB + CRC + slack (FSDI=8 → FSD=256) */
+    static uint8_t  rbuf[270];  /* single-frame receive buffer: up to 256 bytes data + PCB + CRC + slack (FSDI=4 -> FSD=48 (RATS is hardcoded 0x40)) */
     static uint8_t  chain_buf[512]; /* reassembled chained response */
     uint16_t rbits;
     uint8_t  blk = 0;  /* alternating block number */

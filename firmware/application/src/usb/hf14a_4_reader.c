@@ -202,8 +202,20 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
      * this session would fail. Dropping s->active makes ccid_slot_process()
      * answer ICC_MUTE and forces the host to re-power the card, which
      * re-activates it cleanly. */
-    s->blk ^= 1;
     uint8_t  resp_pcb = rbuf[0];
+    /* ISO14443-4 rule B: the PCD toggles its block number when it receives an
+     * I-block (or R(ACK)) whose number EQUALS its current one -- and that
+     * applies to every block of a chained response, not once per APDU.
+     *
+     * `blk = received ^ 1` implements the rule exactly: when the received
+     * number equals s->blk it toggles, and when it differs it leaves s->blk
+     * alone. The previous `s->blk ^= 1` toggled once for a whole chain, so a
+     * chain of even length left the session one block out of step and the card
+     * answered the NEXT APDU by retransmitting its previous response. Invisible
+     * to any test that sends one APDU per session; the CCID path holds a
+     * session across APDUs, so it was fully exposed. The 87-byte PPSE FCI
+     * measured on two payment cards is 45 + 42 -- two blocks, even. */
+    s->blk = (uint8_t)((resp_pcb & 0x01u) ^ 0x01u);
     uint16_t out = 0;
     /* uint16_t, not uint8_t: nothing actually clamps rb to the card FSC -- the
      * transfer is bounded only by rbuf[288] -- so a card sending a >258 byte
@@ -256,7 +268,7 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
                 if (wtxm == 0) wtxm = 1;                    /* 0 is not valid  */
                 uint32_t wtx_to = (uint32_t)TCL_RESP_TIMEOUT_MS * wtxm;
                 if (wtx_to > HF14A_4_WTX_TIMEOUT_MAX_MS) wtx_to = HF14A_4_WTX_TIMEOUT_MAX_MS;
-                if (!tcl_exchange(wtx, 4, s->blk,
+                if (!tcl_exchange(wtx, 4, s->blk,   /* now current, see rule B above */
                                   rbuf, U8ARR_BIT_LEN(rbuf), &rb, wtx_to)) break;
                 resp_pcb = rbuf[0];
                 dlen = (uint16_t)(rb - 3u);
@@ -279,19 +291,38 @@ bool hf14a_4_session_apdu(hf14a_4_session_t *s,
          * a Visa Debit card, which spun the loop until the watchdog reset the
          * device. */
         uint8_t rack[3];
-        uint8_t ack_blk = (uint8_t)((resp_pcb & 0x01u) ^ 0x01u);
+        uint8_t ack_blk = s->blk;   /* == (received ^ 1); kept in sync by rule B */
         rack[0] = (uint8_t)(0xA2u | ack_blk);
         crc_14a_append(rack, 1);
         /* R(NAK) on retry carries the same number we just used for the R(ACK). */
         if (!tcl_exchange(rack, 3, ack_blk,
                           rbuf, U8ARR_BIT_LEN(rbuf), &rb, TCL_RESP_TIMEOUT_MS)) break;
         resp_pcb = rbuf[0];
+        s->blk = (uint8_t)((resp_pcb & 0x01u) ^ 0x01u);   /* rule B, per block */
         dlen = (uint16_t)(rb - 3u);
         if (dlen > 0) {
             if (out + dlen > resp_max) { *resp_len = 0; hf14a_4_session_close(s); return false; } /* overflow: kill the session, see note */
             memcpy(&resp[out], &rbuf[1], dlen);
             out += dlen;
         }
+    }
+
+    /* An incomplete chain is a FAILED exchange, not a short response.
+     *
+     * Every `break` above leaves the chaining bit set, as does exhausting
+     * HF14A_4_CHAIN_MAX_BLOCKS, so this one test covers a mid-chain timeout, a
+     * CRC failure, an unexpected S-block and the block cap alike. Returning the
+     * fragment with success handed the host a mid-response chunk whose last two
+     * bytes it would parse as SW1SW2 -- the same corruption the 0x20 chaining
+     * bug produced, reached by a different route. The rlen < 2 guard in
+     * ccid_slot.c cannot catch it because a truncated chain is 45+ bytes.
+     *
+     * The card is mid-chain and would desync every later APDU, so drop the
+     * session: the slot answers ICC_MUTE and the host re-powers cleanly. */
+    if (resp_pcb & 0x10u) {
+        *resp_len = 0;
+        hf14a_4_session_close(s);
+        return false;
     }
 
     *resp_len = out;
